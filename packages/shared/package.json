@@ -18,6 +18,7 @@
     "./review-args": "./review-args.ts",
     "./vcs-core": "./vcs-core.ts",
     "./checklist": "./checklist.ts",
+    "./chrome-app": "./chrome-app.ts",
     "./types": "./types.ts",
     "./pr-types": "./pr-types.ts",
     "./pr-context-live": "./pr-context-live.ts",

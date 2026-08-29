@@ -212,6 +212,14 @@ export interface PlannotatorConfig {
    */
   glimpse?: boolean;
   /**
+   * Open Plannotator in a dedicated Chrome app window (`--app=<url>`) instead
+   * of a tab in the user's existing browser window. When true (default), a
+   * local session launches the first Chrome-family browser it finds; when no
+   * such browser is installed the normal browser chain runs instead.
+   * Set to false to always use a tab / the configured browser.
+   */
+  chromeApp?: boolean;
+  /**
    * Control URL sharing (Share tab, copy link, short URLs, import review).
    * Defaults to enabled. Set to "disabled" to hide all sharing UI — useful
    * for teams working with sensitive plans. Mirrors the PLANNOTATOR_SHARE
@@ -636,6 +644,20 @@ export function resolveUseGlimpse(config: PlannotatorConfig): boolean {
     return envVal === "1" || envVal.toLowerCase() === "true";
   }
   return coerceConfigBoolean(config.glimpse, true);
+}
+
+/**
+ * Resolve whether to open the session in a Chrome app window.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_CHROME_APP env var  →  config.chromeApp  →  default true
+ */
+export function resolveUseChromeApp(config: PlannotatorConfig): boolean {
+  const envVal = process.env.PLANNOTATOR_CHROME_APP;
+  if (envVal !== undefined) {
+    return envVal === "1" || envVal.toLowerCase() === "true";
+  }
+  return coerceConfigBoolean(config.chromeApp, true);
 }
 
 /**

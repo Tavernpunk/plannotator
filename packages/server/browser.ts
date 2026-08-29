@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
-import { loadConfig, resolveUseGlimpse } from "@plannotator/shared/config";
+import { loadConfig, resolveUseGlimpse, resolveUseChromeApp } from "@plannotator/shared/config";
+import { findChromeAppBinary, isChromeAppCapableBrowser, buildChromeAppArgs } from "@plannotator/shared/chrome-app";
 
 const IPC_REGISTRY = path.join(getPlannotatorDataDir(), "vscode-ipc.json");
 
@@ -185,6 +186,49 @@ async function openGlimpse(url: string): Promise<boolean> {
   });
 }
 
+/**
+ * Open the session in a dedicated Chrome app window (`--app=<url>`).
+ *
+ * Returns false when no Chrome-family browser is installed, or when the launch
+ * fails, so the caller falls through to the normal browser chain rather than
+ * leaving the agent hanging at waitForDecision() with no window.
+ *
+ * Fire-and-forget is safe: when a Chrome instance is already running for the
+ * profile, this invocation relays the request to it and exits in ~100ms.
+ */
+async function openChromeApp(
+  url: string,
+  browserSetting: string | undefined,
+): Promise<boolean> {
+  const binary = findChromeAppBinary(browserSetting);
+  if (!binary) return false;
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (opened: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(opened);
+    };
+    try {
+      const child = spawn(binary, buildChromeAppArgs(url), {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.once("error", () => finish(false));
+      // The relaying invocation exits 0 almost immediately and a cold start
+      // stays alive; neither tells us whether the page rendered, so treat a
+      // spawn that did not error as opened and keep the stderr URL lifeline.
+      setTimeout(() => {
+        child.unref();
+        finish(true);
+      }, 300);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
 export async function openBrowser(
   url: string,
   options?: { isRemote?: boolean; useGlimpse?: boolean }
@@ -198,6 +242,20 @@ export async function openBrowser(
     const envBrowser = isNoOpBrowserSentinel(rawBrowser) ? undefined : rawBrowser;
     const browser = plannotatorBrowser || envBrowser;
     const isRemote = options?.isRemote ?? false;
+
+    // Highest precedence: a dedicated Chrome app window for local sessions.
+    // Skipped when the user explicitly chose a non-Chromium browser (that
+    // choice is a deliberate opt-out), and when remote — a remote session
+    // can't pop a window on the user's machine at all.
+    const chromeAppEligible =
+      !isRemote && (!browser || isChromeAppCapableBrowser(browser));
+    if (chromeAppEligible && resolveUseChromeApp(loadConfig())) {
+      const openedViaChromeApp = await openChromeApp(url, browser);
+      if (openedViaChromeApp) {
+        return true;
+      }
+    }
+
     if (shouldTryRemoteBrowserFallback(isRemote)) {
       const openedViaIpc = await tryVscodeIpc(url);
       if (openedViaIpc) {

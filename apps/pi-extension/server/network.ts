@@ -8,7 +8,8 @@ import { existsSync } from "node:fs";
 import type { Server } from "node:http";
 import { release } from "node:os";
 import { delimiter, join } from "node:path";
-import { loadConfig, resolveUrlHost, resolveUseGlimpse } from "../generated/config.ts";
+import { loadConfig, resolveUrlHost, resolveUseGlimpse, resolveUseChromeApp } from "../generated/config.ts";
+import { findChromeAppBinary, isChromeAppCapableBrowser, buildChromeAppArgs } from "../generated/chrome-app.ts";
 import { parsePortSelection } from "../generated/port-range.ts";
 import { isAutoUrlHost, resolveAutoHostCached } from "../generated/tailscale.ts";
 
@@ -300,6 +301,42 @@ async function openGlimpse(url: string): Promise<boolean> {
 	});
 }
 
+/**
+ * Open the session in a dedicated Chrome app window (`--app=<url>`).
+ * Mirrors packages/server/browser.ts openChromeApp — see that file and
+ * packages/shared/chrome-app.ts for why the random port is not a problem and
+ * why macOS must exec the bundle binary instead of `open -a --args`.
+ */
+async function openChromeApp(
+	url: string,
+	browserSetting: string | undefined,
+): Promise<boolean> {
+	const binary = findChromeAppBinary(browserSetting);
+	if (!binary) return false;
+
+	return await new Promise<boolean>((resolve) => {
+		let settled = false;
+		const finish = (opened: boolean) => {
+			if (settled) return;
+			settled = true;
+			resolve(opened);
+		};
+		try {
+			const child = spawn(binary, buildChromeAppArgs(url), {
+				detached: true,
+				stdio: "ignore",
+			});
+			child.once("error", () => finish(false));
+			setTimeout(() => {
+				child.unref();
+				finish(true);
+			}, 300);
+		} catch {
+			finish(false);
+		}
+	});
+}
+
 export async function openBrowser(url: string): Promise<{
 	opened: boolean;
 	isRemote?: boolean;
@@ -314,6 +351,16 @@ export async function openBrowser(url: string): Promise<{
 	const browser = plannotatorBrowser || envBrowser;
 	if (isRemoteSession() && !browser) {
 		return { opened: false, isRemote: true, url };
+	}
+
+	// Highest precedence: a dedicated Chrome app window for local sessions.
+	// Skipped when the user explicitly chose a non-Chromium browser.
+	const chromeAppEligible =
+		!isRemoteSession() && (!browser || isChromeAppCapableBrowser(browser));
+	if (chromeAppEligible && resolveUseChromeApp(loadConfig())) {
+		if (await openChromeApp(url, browser)) {
+			return { opened: true };
+		}
 	}
 
 	if (!browser && resolveUseGlimpse(loadConfig())) {
