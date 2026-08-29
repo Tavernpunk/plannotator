@@ -110,7 +110,14 @@ export type AgentMode = 'review' | 'tour' | 'guide';
 export type AgentEngine = 'claude' | 'codex';
 // Review-only engine union. Tour stays on the narrow AgentEngine so its
 // exhaustive Record<AgentEngine, ...> maps remain valid without change.
-export type ReviewEngine = AgentEngine | 'cursor' | 'opencode' | 'pi' | 'copilot';
+export type KnownReviewEngine = AgentEngine | 'cursor' | 'opencode' | 'pi' | 'copilot';
+// A code review can also run a user-declared agent variant (see
+// @plannotator/core/agent-variants) — the same base engine spawned with a
+// different environment, e.g. a second Codex account. Its id comes from the
+// user's config, so the review engine type admits arbitrary strings while
+// `(string & {})` keeps editor completion for the built-in six. Guide and tour
+// stay on the closed unions: variants widen the review picker only.
+export type ReviewEngine = KnownReviewEngine | (string & {});
 
 interface AgentSettingsState {
   selectedMode?: AgentMode;
@@ -144,7 +151,7 @@ interface AgentSettingsState {
 }
 
 const BUILTIN_DEFAULT_PROFILE = 'builtin:default';
-const REVIEW_ENGINES: ReviewEngine[] = ['claude', 'codex', 'cursor', 'opencode', 'pi', 'copilot'];
+const REVIEW_ENGINES: KnownReviewEngine[] = ['claude', 'codex', 'cursor', 'opencode', 'pi', 'copilot'];
 
 const initialState: AgentSettingsState = {
   selectedMode: 'review',
@@ -241,12 +248,24 @@ function parseEngine(value: unknown): AgentEngine {
   return value === 'codex' ? 'codex' : 'claude';
 }
 
-function parseReviewEngine(value: unknown): ReviewEngine {
+function parseKnownReviewEngine(value: unknown): KnownReviewEngine {
   if (value === 'cursor') return 'cursor';
   if (value === 'opencode') return 'opencode';
   if (value === 'pi') return 'pi';
   if (value === 'copilot') return 'copilot';
   return parseEngine(value);
+}
+
+// Agent-variant ids are user-defined, so the saved review engine can be a name
+// this build has never heard of. Accept anything id-shaped (the same shape the
+// server validates config-side) and let the capability reconciliation effect
+// fall back to an available engine when it no longer resolves — the identical
+// treatment a since-uninstalled CLI already gets.
+const VARIANT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+function parseReviewEngine(value: unknown): ReviewEngine {
+  if (typeof value === 'string' && VARIANT_ID_PATTERN.test(value)) return value;
+  return parseKnownReviewEngine(value);
 }
 
 function parseMode(value: unknown): AgentMode | undefined {
@@ -266,6 +285,12 @@ export function parseReviewProfileByEngine(parsed: {
   for (const engine of REVIEW_ENGINES) {
     out[engine] = typeof byEngine?.[engine] === 'string' ? (byEngine[engine] as string) : legacy;
   }
+  // Carry through entries for engines this build doesn't know as built-ins —
+  // agent-variant ids, whose per-engine review pick must survive a reload just
+  // like a base engine's.
+  for (const [engine, value] of Object.entries(byEngine ?? {})) {
+    if (typeof value === 'string' && !(engine in out)) out[engine] = value;
+  }
   return out;
 }
 
@@ -279,7 +304,7 @@ function readCookie(): AgentSettingsState {
       reviewEngine: parseReviewEngine(parsed.reviewEngine),
       reviewProfileByEngine: parseReviewProfileByEngine(parsed),
       tourEngine: parseEngine(parsed.tourEngine),
-      guideEngine: parseReviewEngine(parsed.guideEngine),
+      guideEngine: parseKnownReviewEngine(parsed.guideEngine),
       claude: {
         model: typeof parsed.claude?.model === 'string' ? parsed.claude.model : DEFAULT_CLAUDE_MODEL,
         perModel: parsed.claude?.perModel ?? {},

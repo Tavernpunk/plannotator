@@ -20,7 +20,7 @@ import { cn } from '../lib/utils';
 import { ReviewAgentsIcon } from './ReviewAgentsIcon';
 import { ClaudeIcon, CodexIcon, CopilotIcon, CursorIcon, OpenCodeIcon, PiIcon } from './icons/AgentIcons';
 import { useAgentSettings } from '../hooks/useAgentSettings';
-import type { AgentEngine, AgentMode, ReviewEngine } from '../hooks/useAgentSettings';
+import type { AgentEngine, AgentMode, KnownReviewEngine, ReviewEngine } from '../hooks/useAgentSettings';
 import type { AgentLaunchParams } from '../hooks/useAgentJobs';
 import { ConfigRow, SegmentedPicker, Toggle, SelectMenu } from './AgentControls';
 import { CODEX_MODELS, CODEX_EFFORT_LABELS, codexReasoningOptions } from '../utils/codexModels';
@@ -128,10 +128,10 @@ const ENGINE_ICON: Record<AgentEngine, React.FC<{ className?: string }>> = {
 // review surface offers the wider set (Cursor/OpenCode). Exported so the guide
 // takeover surfaces (GuideScreen, GuideEmptyState in packages/review-editor)
 // share this one source of truth instead of keeping their own copies in sync.
-export const REVIEW_ENGINE_LABEL: Record<ReviewEngine, string> = GUIDE_ENGINE_LABEL;
+export const REVIEW_ENGINE_LABEL: Record<KnownReviewEngine, string> = GUIDE_ENGINE_LABEL;
 
 // Review-only icon map — the wide set. Tour keeps the narrow ENGINE_ICON.
-const REVIEW_ENGINE_ICON: Record<ReviewEngine, React.FC<{ className?: string }>> = {
+const REVIEW_ENGINE_ICON: Record<KnownReviewEngine, React.FC<{ className?: string }>> = {
   claude: ClaudeIcon,
   codex: CodexIcon,
   cursor: CursorIcon,
@@ -139,6 +139,31 @@ const REVIEW_ENGINE_ICON: Record<ReviewEngine, React.FC<{ className?: string }>>
   pi: PiIcon,
   copilot: CopilotIcon,
 };
+
+// --- Agent variants (see @plannotator/core/agent-variants) ------------------
+//
+// A variant is the same base CLI spawned with a different environment — a
+// second logged-in account — so it borrows the base's icon, models and config
+// controls, and is told apart by an accent: a dot on its picker button, an
+// accent ring when selected, and the caption under the row.
+//
+// The class strings are literal per accent because Tailwind only generates
+// classes it can see in source; an interpolated `bg-${accent}-500` would emit
+// nothing.
+const VARIANT_ACCENT_CLASS: Record<string, { dot: string; ring: string; text: string }> = {
+  violet: { dot: 'bg-violet-500', ring: 'border-violet-500/60 bg-violet-500/10', text: 'text-violet-600 dark:text-violet-400' },
+  amber: { dot: 'bg-amber-500', ring: 'border-amber-500/60 bg-amber-500/10', text: 'text-amber-600 dark:text-amber-400' },
+  emerald: { dot: 'bg-emerald-500', ring: 'border-emerald-500/60 bg-emerald-500/10', text: 'text-emerald-600 dark:text-emerald-400' },
+  sky: { dot: 'bg-sky-500', ring: 'border-sky-500/60 bg-sky-500/10', text: 'text-sky-600 dark:text-sky-400' },
+  rose: { dot: 'bg-rose-500', ring: 'border-rose-500/60 bg-rose-500/10', text: 'text-rose-600 dark:text-rose-400' },
+  slate: { dot: 'bg-slate-500', ring: 'border-slate-500/60 bg-slate-500/10', text: 'text-slate-600 dark:text-slate-400' },
+};
+
+const DEFAULT_VARIANT_ACCENT = 'violet';
+
+function variantAccentClass(accent: string | undefined) {
+  return VARIANT_ACCENT_CLASS[accent ?? ''] ?? VARIANT_ACCENT_CLASS[DEFAULT_VARIANT_ACCENT];
+}
 
 export type AgentLaunchResult = AgentJobInfo | null | void;
 
@@ -383,6 +408,7 @@ function JobCard({
   onToggle,
   onViewDetails,
   onOpenGuide,
+  variant,
 }: {
   job: AgentJobInfo;
   annotationCount: number;
@@ -391,8 +417,15 @@ function JobCard({
   onToggle: () => void;
   onViewDetails?: () => void;
   onOpenGuide?: () => void;
+  /** Set when this job ran as a user-declared agent variant: the chip shows the
+   *  variant's name and accent, and the model label is read off the BASE engine
+   *  (a variant id matches none of formatModel's provider branches). */
+  variant?: { label: string; base: string; accent?: string };
 }) {
   const isTerminal = isTerminalStatus(job.status);
+  const providerLabel = variant?.label ?? job.provider;
+  const providerBase = variant?.base ?? job.provider;
+  const variantAccent = variant ? variantAccentClass(variant.accent) : null;
 
   return (
     <div
@@ -410,9 +443,20 @@ function JobCard({
             {onViewDetails && <ExternalLink className="shrink-0 text-muted-foreground/30" size={9} />}
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-1 text-[9px] text-muted-foreground/50">
-            <span className="rounded bg-surface-1 px-1 py-px">{job.provider}</span>
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 rounded px-1 py-px',
+                variantAccent ? variantAccent.text : undefined,
+                'bg-surface-1',
+              )}
+            >
+              {variantAccent && (
+                <span aria-hidden className={cn('h-1.5 w-1.5 rounded-full', variantAccent.dot)} />
+              )}
+              {providerLabel}
+            </span>
             {job.model && (
-              <span className="rounded bg-surface-1 px-1 py-px font-mono">{formatModel(job.provider, job.engine, job.model)}</span>
+              <span className="rounded bg-surface-1 px-1 py-px font-mono">{formatModel(providerBase, job.engine, job.model)}</span>
             )}
             {job.effort && <span className="rounded bg-surface-1 px-1 py-px">{formatEffort(job.effort)}</span>}
             {job.reasoningEffort && <span className="rounded bg-surface-1 px-1 py-px">{formatReasoning(job.reasoningEffort)}</span>}
@@ -617,6 +661,37 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
   const piAvailable = capabilities?.providers.some((p) => p.id === 'pi' && p.available) ?? false;
   const copilotAvailable = capabilities?.providers.some((p) => p.id === 'copilot' && p.available) ?? false;
 
+  // Agent variants the server advertised — a capability carrying `base` is a
+  // variant of that base engine. Availability is decided server-side (the
+  // variant's own binary must be on PATH), so the client just reads the flag.
+  const reviewVariants = useMemo(
+    () =>
+      (capabilities?.providers ?? [])
+        .filter((p) => !!p.base && p.available)
+        .map((p) => ({ id: p.id, base: p.base as KnownReviewEngine, label: p.name, accent: p.accent })),
+    [capabilities],
+  );
+
+  // Every per-engine control keys off the BASE: a variant runs the same CLI
+  // with a different environment, so it shares its base's models, effort knobs
+  // and icon. Non-variant ids resolve to themselves.
+  const engineBase = useCallback(
+    (engine: ReviewEngine): KnownReviewEngine =>
+      (reviewVariants.find((v) => v.id === engine)?.base ?? engine) as KnownReviewEngine,
+    [reviewVariants],
+  );
+  const engineLabel = useCallback(
+    (engine: ReviewEngine): string =>
+      reviewVariants.find((v) => v.id === engine)?.label
+      ?? REVIEW_ENGINE_LABEL[engine as KnownReviewEngine]
+      ?? engine,
+    [reviewVariants],
+  );
+  const engineAccent = useCallback(
+    (engine: ReviewEngine): string | undefined => reviewVariants.find((v) => v.id === engine)?.accent,
+    [reviewVariants],
+  );
+
   // Cursor's model catalog is account-specific and discovered server-side, so
   // prefer the live list from the capability; fall back to `auto`-only when the
   // server reports none (e.g. unauthenticated CLI).
@@ -659,14 +734,28 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
   }, [claudeAvailable, codexAvailable]);
 
   // Review engines (wide union) = tour engines + cursor/opencode when available.
-  const availableReviewEngines = useMemo<ReviewEngine[]>(() => {
-    const engines: ReviewEngine[] = [...availableEngines];
+  const availableBaseReviewEngines = useMemo<KnownReviewEngine[]>(() => {
+    const engines: KnownReviewEngine[] = [...availableEngines];
     if (cursorAvailable) engines.push('cursor');
     if (opencodeAvailable) engines.push('opencode');
     if (piAvailable) engines.push('pi');
     if (copilotAvailable) engines.push('copilot');
     return engines;
   }, [availableEngines, cursorAvailable, opencodeAvailable, piAvailable, copilotAvailable]);
+
+  // …plus each user-declared variant, slotted in right after the base it
+  // re-points so "Codex" and "Codex Work" sit next to each other rather than
+  // at opposite ends of the row.
+  const availableReviewEngines = useMemo<ReviewEngine[]>(() => {
+    const engines: ReviewEngine[] = [];
+    for (const base of availableBaseReviewEngines) {
+      engines.push(base);
+      for (const variant of reviewVariants) {
+        if (variant.base === base) engines.push(variant.id);
+      }
+    }
+    return engines;
+  }, [availableBaseReviewEngines, reviewVariants]);
 
   const availableModes = useMemo<AgentMode[]>(() => {
     const modes: AgentMode[] = [];
@@ -683,13 +772,19 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
 
   const firstAvailableEngine = availableEngines[0] ?? null;
   const firstAvailableReviewEngine = availableReviewEngines[0] ?? null;
+  // Guide never offers variants (they widen the review picker only), so its
+  // reconciliation falls back to a BASE engine.
+  const firstAvailableGuideEngine = availableBaseReviewEngines[0] ?? null;
   const engineAvailable = (engine: AgentEngine) => engine === 'claude' ? claudeAvailable : codexAvailable;
-  const reviewEngineAvailable = (engine: ReviewEngine) =>
-    engine === 'cursor' ? cursorAvailable
+  const reviewEngineAvailable = (engine: ReviewEngine): boolean =>
+    // A variant is available on its own advertised flag, never its base's: the
+    // base's CLI can be installed while the variant's binary override is not.
+    reviewVariants.some((v) => v.id === engine) ? true
+      : engine === 'cursor' ? cursorAvailable
       : engine === 'opencode' ? opencodeAvailable
       : engine === 'pi' ? piAvailable
       : engine === 'copilot' ? copilotAvailable
-      : engineAvailable(engine);
+      : engineAvailable(engine as AgentEngine);
 
   // Reconcile mode + engine choices against live capabilities. Runs when
   // capabilities change or the stored selection becomes invalid.
@@ -704,14 +799,15 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     if (firstAvailableEngine && !engineAvailable(tourEngine)) {
       setTourEngine(firstAvailableEngine);
     }
-    if (firstAvailableReviewEngine && !reviewEngineAvailable(guideEngine)) {
-      setGuideEngine(firstAvailableReviewEngine);
+    if (firstAvailableGuideEngine && !reviewEngineAvailable(guideEngine)) {
+      setGuideEngine(firstAvailableGuideEngine);
     }
   }, [
     capabilities,
     availableModes,
     firstAvailableEngine,
     firstAvailableReviewEngine,
+    firstAvailableGuideEngine,
     selectedMode,
     reviewEngine,
     tourEngine,
@@ -802,19 +898,28 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     ? reviewProfileId
     : 'builtin:default';
 
+  // The engine whose config controls the review panel renders. A variant shares
+  // its base's model/effort settings because it runs the same CLI.
+  const reviewEngineBase = engineBase(reviewEngine);
+
   type LaunchParams = AgentLaunchParams;
-  const buildReviewLaunch = (engine: ReviewEngine): LaunchParams => {
+  const buildReviewLaunch = (selected: ReviewEngine): LaunchParams => {
     // Carry the chosen review only when it is a custom one. Absent → the server
     // resolves to the built-in default.
     const review = effectiveReviewProfileId !== 'builtin:default' ? { reviewProfileId: effectiveReviewProfileId } : {};
+    // A variant borrows its base's settings (same CLI, same models) but must
+    // launch under its OWN provider id — that id is what tells the server which
+    // env overlay to spawn with.
+    const engine = engineBase(selected);
+    const provider = selected;
     if (engine === 'claude') {
-      return { provider: 'claude', label: 'Code Review', model: claudeModel, effort: claudeEffort, ...review };
+      return { provider, label: 'Code Review', model: claudeModel, effort: claudeEffort, ...review };
     }
     if (engine === 'cursor') {
       // Omission ⇒ auto: drop the model client-side when it's `auto` so the POST
       // carries no model and the server lets Cursor pick its default.
       return {
-        provider: 'cursor',
+        provider,
         label: 'Code Review',
         ...(cursorModel && cursorModel.toLowerCase() !== 'auto' ? { model: cursorModel } : {}),
         ...review,
@@ -823,7 +928,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     if (engine === 'opencode') {
       // Empty model ⇒ OpenCode's configured default; only send a real model id.
       return {
-        provider: 'opencode',
+        provider,
         label: 'Code Review',
         ...(opencodeModel ? { model: opencodeModel } : {}),
         ...review,
@@ -832,7 +937,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     if (engine === 'pi') {
       // Empty model ⇒ Pi's own default; only send a real model id.
       return {
-        provider: 'pi',
+        provider,
         label: 'Code Review',
         ...(piModel ? { model: piModel } : {}),
         thinking: piThinking,
@@ -842,14 +947,14 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     if (engine === 'copilot') {
       // Empty model ⇒ Copilot's own pick; only send a real model id.
       return {
-        provider: 'copilot',
+        provider,
         label: 'Code Review',
         ...(copilotModel ? { model: copilotModel } : {}),
         ...review,
       };
     }
     return {
-      provider: 'codex',
+      provider,
       label: 'Code Review',
       model: codexModel,
       reasoningEffort: codexReasoning,
@@ -975,41 +1080,84 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
     value: E,
     onChange: (engine: E) => void,
     engines: E[],
-    iconMap: Record<E, React.FC<{ className?: string }>>,
-    labelMap: Record<E, string>,
+    iconMap: Record<string, React.FC<{ className?: string }> | undefined>,
+    labelMap: Record<string, string | undefined>,
     configLabel: string = 'Engine',
+    // Supplied by the review picker only: a variant borrows its base's icon, so
+    // the row needs to know which base to draw and which accent marks it as a
+    // variant. Omitted ⇒ every entry is a built-in engine (tour, guide).
+    variantInfo?: {
+      base: (engine: E) => string;
+      label: (engine: E) => string;
+      accent: (engine: E) => string | undefined;
+    },
   ) {
-    const StaticIcon: React.FC<{ className?: string }> = iconMap[value];
+    const iconFor = (engine: E): React.FC<{ className?: string }> =>
+      iconMap[variantInfo ? variantInfo.base(engine) : engine]
+      ?? ((props: { className?: string }) => <Bot className={props.className} />);
+    const labelFor = (engine: E): string =>
+      (variantInfo ? variantInfo.label(engine) : labelMap[engine]) ?? engine;
+    const accentFor = (engine: E): string | undefined => variantInfo?.accent(engine);
+    // A row that mixes an engine with a variant of it shows two identical
+    // marks, so the selected engine's name is spelled out beneath it. Rows of
+    // built-in engines keep the icon-only presentation they have today.
+    const showCaption = engines.some((engine) => !!accentFor(engine));
+    const StaticIcon = iconFor(value);
     return (
       <ConfigRow label={configLabel} stacked>
         {engines.length > 1 ? (
           // Tap an agent's mark to pick it — no dropdown.
-          <div className="flex items-center gap-1.5">
-            {engines.map((engine) => {
-              const Icon: React.FC<{ className?: string }> = iconMap[engine];
-              const selected = value === engine;
-              return (
-                <button
-                  key={engine}
-                  type="button"
-                  onClick={() => onChange(engine)}
-                  title={labelMap[engine]}
-                  aria-label={labelMap[engine]}
-                  aria-pressed={selected}
-                  className={cn(
-                    'flex h-9 w-9 items-center justify-center rounded-lg border transition-all',
-                    selected
-                      ? 'border-primary/40 bg-primary/5'
-                      : 'border-border/30 bg-surface-1/30 opacity-40 hover:opacity-100',
-                  )}
-                >
-                  <Icon className="h-5 w-5" />
-                </button>
-              );
-            })}
+          <div className="flex flex-col gap-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {engines.map((engine) => {
+                const Icon = iconFor(engine);
+                const selected = value === engine;
+                const accent = accentFor(engine);
+                const accentClass = accent ? variantAccentClass(accent) : null;
+                return (
+                  <button
+                    key={engine}
+                    type="button"
+                    onClick={() => onChange(engine)}
+                    title={labelFor(engine)}
+                    aria-label={labelFor(engine)}
+                    aria-pressed={selected}
+                    className={cn(
+                      'relative flex h-9 w-9 items-center justify-center rounded-lg border transition-all',
+                      selected
+                        ? accentClass
+                          ? accentClass.ring
+                          : 'border-primary/40 bg-primary/5'
+                        : 'border-border/30 bg-surface-1/30 opacity-40 hover:opacity-100',
+                    )}
+                  >
+                    <Icon className="h-5 w-5" />
+                    {accentClass && (
+                      <span
+                        aria-hidden
+                        className={cn(
+                          'absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full ring-2 ring-card',
+                          accentClass.dot,
+                        )}
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            {showCaption && (
+              <span
+                className={cn(
+                  'text-[10px] leading-none',
+                  accentFor(value) ? variantAccentClass(accentFor(value)).text : 'text-muted-foreground/60',
+                )}
+              >
+                {labelFor(value)}
+              </span>
+            )}
           </div>
         ) : (
-          renderStaticChoice(labelMap[value], <StaticIcon className="h-4 w-4" />)
+          renderStaticChoice(labelFor(value), <StaticIcon className="h-4 w-4" />)
         )}
       </ConfigRow>
     );
@@ -1073,6 +1221,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                   REVIEW_ENGINE_ICON,
                   REVIEW_ENGINE_LABEL,
                   'Provider',
+                  { base: engineBase, label: engineLabel, accent: engineAccent },
                 )}
                 <ConfigRow label="Review" stacked>
                   <SelectMenu
@@ -1082,7 +1231,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                     footerAction={{ label: 'Add new review', onClick: () => setAddReviewOpen(true) }}
                   />
                 </ConfigRow>
-                {reviewEngine === 'claude' && (
+                {reviewEngineBase === 'claude' && (
                   <>
                     <ConfigRow label="Model" stacked>
                       <SelectMenu value={claudeModel} options={CLAUDE_MODELS} onChange={setClaudeModel} />
@@ -1092,7 +1241,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                     </ConfigRow>
                   </>
                 )}
-                {reviewEngine === 'codex' && (
+                {reviewEngineBase === 'codex' && (
                   <>
                     <ConfigRow label="Model" stacked>
                       <SelectMenu value={codexModel} options={CODEX_MODELS} onChange={setCodexModel} />
@@ -1105,9 +1254,9 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                     </ConfigRow>
                   </>
                 )}
-                {reviewEngine === 'cursor' && renderMarkerEngineConfig(cursorModel, cursorModels, setCursorModel)}
-                {reviewEngine === 'opencode' && renderMarkerEngineConfig(opencodeModel, opencodeModels, setOpencodeModel)}
-                {reviewEngine === 'pi' && (
+                {reviewEngineBase === 'cursor' && renderMarkerEngineConfig(cursorModel, cursorModels, setCursorModel)}
+                {reviewEngineBase === 'opencode' && renderMarkerEngineConfig(opencodeModel, opencodeModels, setOpencodeModel)}
+                {reviewEngineBase === 'pi' && (
                   <>
                     {renderMarkerEngineConfig(piModel, piModels, setPiModel)}
                     <ConfigRow label="Thinking" stacked>
@@ -1115,7 +1264,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
                     </ConfigRow>
                   </>
                 )}
-                {reviewEngine === 'copilot' && renderMarkerEngineConfig(copilotModel, copilotModels, setCopilotModel)}
+                {reviewEngineBase === 'copilot' && renderMarkerEngineConfig(copilotModel, copilotModels, setCopilotModel)}
               </>
             )}
 
@@ -1153,7 +1302,7 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
 
             {selectedMode === 'guide' && (
               <>
-                {renderEngineSelect(guideEngine, setGuideEngine, availableReviewEngines, REVIEW_ENGINE_ICON, REVIEW_ENGINE_LABEL)}
+                {renderEngineSelect(guideEngine as KnownReviewEngine, setGuideEngine, availableBaseReviewEngines, REVIEW_ENGINE_ICON, REVIEW_ENGINE_LABEL)}
                 {(guideEngine === 'claude' || guideEngine === 'codex') && (
                   <ConfigRow label="Model" stacked>
                     <SelectMenu
@@ -1243,6 +1392,10 @@ export const AgentsTab: React.FC<AgentsTabProps> = ({
               onToggle={() => setExpandedJobId(expandedJobId === job.id ? null : job.id)}
               onViewDetails={onOpenJobDetail ? () => onOpenJobDetail(job.id) : undefined}
               onOpenGuide={onOpenGuide && (canOpenGuideJob?.(job) ?? true) ? () => onOpenGuide(job.id) : undefined}
+              variant={(() => {
+                const v = reviewVariants.find((rv) => rv.id === job.provider);
+                return v ? { label: v.label, base: v.base, accent: v.accent } : undefined;
+              })()}
             />
           ))
         )}

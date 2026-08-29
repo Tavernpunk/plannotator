@@ -24,6 +24,7 @@ import {
 	AGENT_HEARTBEAT_INTERVAL_MS,
 } from "../generated/agent-jobs.ts";
 import { resolveGuideLaunchInstructions } from "../generated/guide-instructions-store.ts";
+import type { AgentVariant } from "../generated/agent-variants.ts";
 import type { GuideLaunchReview } from "../generated/guide-format.ts";
 import { formatClaudeLogEvent } from "../generated/claude-review.ts";
 import {
@@ -57,6 +58,15 @@ const SERVER_BUILT_PROVIDERS: ReadonlySet<string> = new Set([
 	"copilot",
 ]);
 
+/**
+ * A user-declared variant is as server-built as the base engine it re-points:
+ * its argv comes from the same builder, so client-supplied argv must never be
+ * spawned for it either.
+ */
+function isServerBuilt(provider: string, variants: readonly AgentVariant[]): boolean {
+	return SERVER_BUILT_PROVIDERS.has(provider) || variants.some((v) => v.id === provider);
+}
+
 // ---------------------------------------------------------------------------
 // which() helper for Node.js
 // ---------------------------------------------------------------------------
@@ -85,6 +95,12 @@ export interface AgentJobHandlerOptions {
 	 */
 	getServerUrl: () => string;
 	getCwd: () => string;
+	/**
+	 * User-declared agent variants (see ../generated/agent-variants.ts). Each
+	 * one whose base engine is available becomes its own capability, spawned
+	 * with the variant's env overlay.
+	 */
+	variants?: readonly AgentVariant[];
 	/** Build the command server-side for a given provider. */
 	buildCommand?: (provider: string, config?: Record<string, unknown>) => Promise<{
 		command: string[];
@@ -130,6 +146,10 @@ export interface AgentJobHandlerOptions {
 		 *  AgentJobInfo, which is broadcast over SSE — and handed to
 		 *  onJobComplete for persistence beside the guide (portable export). */
 		launchReview?: GuideLaunchReview;
+		/** Environment overlay for the spawned process — set for agent-variant
+		 *  providers, whose whole point is running the base binary with a
+		 *  different env (a second account's CODEX_HOME). */
+		env?: Record<string, string>;
 	} | null>;
 	/** Called when a job completes successfully — parse results and push annotations. */
 	onJobComplete?: (job: AgentJobInfo, meta: { outputPath?: string; stdout?: string; cwd?: string; changedFilesSnapshot?: string[]; launchReview?: GuideLaunchReview }) => void | Promise<void>;
@@ -195,6 +215,22 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 			available: mode === "review" && whichCmd(engine.binary),
 		});
 	}
+	// User-declared variants — one extra capability per variant, carrying the
+	// base it borrows models, settings and its icon from. Review-only, exactly
+	// like the Bun server: guide and tour keep the built-in set. Availability is
+	// the variant's OWN binary when it overrides one, else the base's.
+	const variants = options.variants ?? [];
+	for (const variant of variants) {
+		const baseBinary =
+			MARKER_ENGINES[variant.base as MarkerEngineId]?.binary ?? variant.base;
+		capabilities.push({
+			id: variant.id,
+			name: variant.label,
+			available: mode === "review" && whichCmd(variant.binary ?? baseBinary),
+			base: variant.base,
+			accent: variant.accent,
+		});
+	}
 
 	const markerModelsCache = new Map<string, MarkerModel[]>();
 	async function buildCapabilitiesResponse(): Promise<AgentCapabilities> {
@@ -232,7 +268,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 		command: string[],
 		label: string,
 		outputPath?: string,
-		spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; thinking?: string; prUrl?: string; diffScope?: string; diffContext?: AgentJobInfo["diffContext"]; reviewProfileId?: string; reviewProfileLabel?: string; changedFilesSnapshot?: string[]; guideContext?: AgentJobInfo["guideContext"]; launchReview?: GuideLaunchReview },
+		spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; env?: Record<string, string>; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; thinking?: string; prUrl?: string; diffScope?: string; diffContext?: AgentJobInfo["diffContext"]; reviewProfileId?: string; reviewProfileLabel?: string; changedFilesSnapshot?: string[]; guideContext?: AgentJobInfo["guideContext"]; launchReview?: GuideLaunchReview },
 	): AgentJobInfo {
 		const source = jobSource(id);
 
@@ -275,6 +311,10 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 				],
 				env: {
 					...process.env,
+					// An agent variant's env overlay sits between the inherited env
+					// and Plannotator's own vars: it may re-point the agent
+					// (CODEX_HOME), never the callback URL annotations return on.
+					...(spawnOptions?.env ?? {}),
 					PLANNOTATOR_AGENT_SOURCE: source,
 					PLANNOTATOR_API_URL: getServerUrl(),
 				},
@@ -618,7 +658,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 					// Fail-closed enforcement for server-owned providers: the command MUST
 					// be built server-side. Client-supplied argv is never spawned for these
 					// providers — a null/throwing builder becomes an error, not a fallback.
-					if (SERVER_BUILT_PROVIDERS.has(provider)) {
+					if (isServerBuilt(provider, variants)) {
 						if (!options.buildCommand) {
 							json(res, { error: `Provider ${provider} requires server-built command` }, 400);
 							return true;
@@ -647,6 +687,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 					let jobChangedFilesSnapshot: string[] | undefined;
 					let jobGuideContext: AgentJobInfo["guideContext"] | undefined;
 					let jobLaunchReview: GuideLaunchReview | undefined;
+					let jobEnv: Record<string, string> | undefined;
 					const jobId = crypto.randomUUID();
 					if (options.buildCommand) {
 						// Thread config from POST body to buildCommand
@@ -689,6 +730,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 							jobChangedFilesSnapshot = built.changedFilesSnapshot;
 							jobGuideContext = built.guideContext;
 							jobLaunchReview = built.launchReview;
+							jobEnv = built.env;
 						}
 					}
 
@@ -716,6 +758,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions) {
 						changedFilesSnapshot: jobChangedFilesSnapshot,
 						guideContext: jobGuideContext,
 						launchReview: jobLaunchReview,
+						env: jobEnv,
 					});
 					json(res, { job }, 201);
 				} catch (err) {

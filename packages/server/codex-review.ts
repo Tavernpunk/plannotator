@@ -197,15 +197,17 @@ export interface CodexCommandOptions {
   model?: string;
   reasoningEffort?: string;
   fastMode?: boolean;
+  /** Binary to invoke. Agent variants may re-point it; defaults to `codex`. */
+  binary?: string;
 }
 
 /** Build the `codex exec` argv array. Materializes the schema file on first call. */
 export async function buildCodexCommand(options: CodexCommandOptions): Promise<string[]> {
-  const { cwd, outputPath, prompt, model, reasoningEffort, fastMode } = options;
+  const { cwd, outputPath, prompt, model, reasoningEffort, fastMode, binary } = options;
   const schemaPath = await ensureSchemaFile();
 
   const command = [
-    "codex",
+    binary || "codex",
     ...(model ? ["-m", model] : []),
     ...(reasoningEffort ? ["-c", `model_reasoning_effort=${reasoningEffort}`] : []),
     ...(fastMode ? ["-c", "service_tier=fast"] : []),

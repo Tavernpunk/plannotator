@@ -137,6 +137,15 @@ export interface AgentCapability {
    * drives its model picker from this instead of a hardcoded list.
    */
   models?: { id: string; label: string }[];
+  /**
+   * Set only on a user-declared agent variant (see
+   * @plannotator/core/agent-variants): the base engine whose models, settings
+   * and icon this provider borrows. The UI keys every per-engine control off
+   * this rather than off `id`, so a variant needs no UI branch of its own.
+   */
+  base?: string;
+  /** Picker accent that tells a variant apart from its base. Variants only. */
+  accent?: string;
 }
 
 export interface AgentCapabilities {

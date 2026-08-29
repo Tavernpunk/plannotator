@@ -138,6 +138,11 @@ import {
   BUILTIN_DEFAULT_PROFILE,
   type ReviewProfilesResponse,
 } from "@plannotator/shared/review-profiles";
+import {
+  findAgentVariant,
+  loadAgentVariants,
+  resolveProviderBase,
+} from "@plannotator/shared/agent-variants-node";
 
 // Review ingestion completion semantics (REVIEW_OUTPUT_FAILED,
 // markJobReviewFailed) now live in @plannotator/shared/agent-jobs.
@@ -1036,12 +1041,29 @@ export async function startReviewServer(
     });
   };
 
+  // User-declared agent variants (see @plannotator/core/agent-variants). Read
+  // once at server start, like every other config-derived setting here: a
+  // variant list that changed mid-session would let a job launch against a
+  // provider the capability list never advertised.
+  const agentVariants = loadAgentVariants();
+
   const agentJobs = createAgentJobHandler({
     mode: "review",
     getServerUrl: () => agentApiUrl,
     getCwd: resolveAgentCwd,
+    variants: agentVariants,
 
-    async buildCommand(provider, config) {
+    async buildCommand(requestedProvider, config) {
+      // An agent variant dispatches as its base engine: same prompt, same
+      // argv builder, same output parser. Only the spawn env (and optionally
+      // the binary) differ, and both ride out on the built command below.
+      const variant = findAgentVariant(requestedProvider, agentVariants);
+      const provider = variant?.base ?? requestedProvider;
+      // Stamped onto every built command so the job records which variant ran
+      // and the spawn gets its env overlay.
+      const variantSpawn = variant
+        ? { env: variant.env, ...(variant.binary && { binary: variant.binary }) }
+        : undefined;
       // Snapshot ALL launch-relevant state before any await: waiting out the
       // checkout warmup below yields to other requests (e.g. pr-switch), and
       // the job's cwd, prompt, and PR attribution must describe the same PR.
@@ -1331,16 +1353,16 @@ export async function startReviewServer(
         const fastMode = config?.fastMode === true;
         const outputPath = generateOutputPath();
         const prompt = composeCodexReviewPrompt(userMessage, reviewProfile);
-        const command = await buildCodexCommand({ cwd, outputPath, prompt, model, reasoningEffort, fastMode });
-        return { command, outputPath, prompt, cwd, label: jobLabel, model, reasoningEffort, fastMode: fastMode || undefined, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label };
+        const command = await buildCodexCommand({ cwd, outputPath, prompt, model, reasoningEffort, fastMode, binary: variantSpawn?.binary });
+        return { command, outputPath, prompt, cwd, label: jobLabel, model, reasoningEffort, fastMode: fastMode || undefined, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label, ...(variantSpawn && { env: variantSpawn.env }) };
       }
 
       if (provider === "claude") {
         const model = typeof config?.model === "string" && config.model ? config.model : undefined;
         const effort = typeof config?.effort === "string" && config.effort ? config.effort : undefined;
         const prompt = composeClaudeReviewPrompt(userMessage, reviewProfile);
-        const { command, stdinPrompt } = buildClaudeCommand(prompt, model, effort);
-        return { command, stdinPrompt, prompt, cwd, label: jobLabel, captureStdout: true, model, effort, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label };
+        const { command, stdinPrompt } = buildClaudeCommand(prompt, model, effort, variantSpawn?.binary);
+        return { command, stdinPrompt, prompt, cwd, label: jobLabel, captureStdout: true, model, effort, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label, ...(variantSpawn && { env: variantSpawn.env }) };
       }
 
       // Marker engines (Cursor, OpenCode, Pi) — one branch, same shape as Claude.
@@ -1361,7 +1383,11 @@ export async function startReviewServer(
         const nonce = makeMarkerNonce();
         const prompt = composeMarkerReviewPrompt(reviewProfile, userMessage, nonce);
         const { command } = buildMarkerCommand(markerEngine, prompt, model, cwd, { thinking, cursorSandbox: resolveCursorSandbox(loadConfig()) });
-        return { command, prompt, cwd, label: jobLabel, captureStdout: true, model, thinking, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label };
+        // Each marker engine's buildArgv writes its binary as a literal argv[0]
+        // rather than reading engine.binary, so a variant's binary override is
+        // applied here instead of through the descriptor.
+        if (variantSpawn?.binary) command[0] = variantSpawn.binary;
+        return { command, prompt, cwd, label: jobLabel, captureStdout: true, model, thinking, prUrl: launchPrUrl, diffScope: launchDiffScope, diffContext, reviewProfileId: reviewProfile.id, reviewProfileLabel: reviewProfile.label, ...(variantSpawn && { env: variantSpawn.env }) };
       }
 
       return null;
@@ -1369,6 +1395,15 @@ export async function startReviewServer(
 
     async onJobComplete(job, meta) {
       const cwd = meta.cwd ?? resolveAgentCwd();
+      // A variant job's provider is the variant id; its OUTPUT is whatever its
+      // base engine produces, so every parse branch below dispatches on the
+      // base. Non-variant providers resolve to themselves.
+      const providerBase = resolveProviderBase(job.provider, agentVariants);
+      // Findings are attributed to the variant's label ("Codex Work") rather
+      // than the base engine's, so two accounts' reviews stay tellable apart
+      // in the annotation list. Undefined for a non-variant job, which keeps
+      // each engine's own author string.
+      const variantAuthor = findAgentVariant(job.provider, agentVariants)?.label;
       const jobPrUrl = job.prUrl;
       const jobDiffScope = job.diffScope;
       const jobPrMeta = jobPrUrl ? prSwitchCache.get(jobPrUrl)?.metadata : undefined;
@@ -1402,7 +1437,7 @@ export async function startReviewServer(
       };
 
       // --- Codex path ---
-      if (job.provider === "codex") {
+      if (providerBase === "codex") {
         const output = meta.outputPath ? await parseCodexOutput(meta.outputPath) : null;
         if (!output) {
           // Process exited 0 but output is missing/unparseable — not a green run.
@@ -1424,7 +1459,7 @@ export async function startReviewServer(
             output.findings,
             job.source,
             cwd,
-            "Codex",
+            variantAuthor ?? "Codex",
             workspace ? (filePath) => workspace.normalizeAnnotationPath(filePath) : undefined,
           ),
           "codex-review",
@@ -1433,7 +1468,7 @@ export async function startReviewServer(
       }
 
       // --- Claude path ---
-      if (job.provider === "claude") {
+      if (providerBase === "claude") {
         const stdout = meta.stdout ?? "";
         const output = parseClaudeStreamOutput(stdout);
         if (!output) {
@@ -1471,7 +1506,7 @@ export async function startReviewServer(
       // an exit-0 job marked done). Mirrors the Tour fail-closed pattern below.
       // Findings carry nullable file/line, classified into line/whole-file/
       // general by transformMarkerFindings — nothing is dropped (same as Claude).
-      const markerEngine = MARKER_ENGINES[job.provider as MarkerEngineId];
+      const markerEngine = MARKER_ENGINES[providerBase as MarkerEngineId];
       if (markerEngine) {
         // Recover the per-job nonce embedded in the prompt; without it no block
         // can be trusted, so parse fails closed below.

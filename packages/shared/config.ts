@@ -266,6 +266,17 @@ export interface PlannotatorConfig {
    * 'totman' (production brand mascot) or 'classic' (historical dark-navy P tile).
    */
   favicon?: FaviconStyle;
+  /**
+   * User-declared alternate configurations of a review CLI — the same agent
+   * binary spawned with a different environment, so a second logged-in account
+   * (`CODEX_HOME`) appears in the code-review engine picker as its own choice.
+   *
+   * Deliberately typed `unknown` here: the shape, its validation and its caps
+   * live in @plannotator/core/agent-variants, and the node-side loader that
+   * reads this key is loadAgentVariants() in ./agent-variants. Invalid entries
+   * are dropped with a stderr warning rather than failing the load.
+   */
+  agentVariants?: unknown;
 }
 
 /** Parse the only server-writable call-review analysis flags. */

@@ -41,6 +41,7 @@
     "./external-annotation": "./external-annotation.ts",
     "./agent-jobs": "./agent-jobs.ts",
     "./agent-terminal": "./agent-terminal.ts",
+    "./agent-variants-node": "./agent-variants-node.ts",
     "./config": "./config.ts",
     "./data-dir": "./data-dir.ts",
     "./prompts": "./prompts.ts",
