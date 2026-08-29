@@ -42,6 +42,7 @@
     "./agent-jobs": "./agent-jobs.ts",
     "./agent-terminal": "./agent-terminal.ts",
     "./agent-variants-node": "./agent-variants-node.ts",
+    "./review-axes": "./review-axes.ts",
     "./config": "./config.ts",
     "./data-dir": "./data-dir.ts",
     "./prompts": "./prompts.ts",

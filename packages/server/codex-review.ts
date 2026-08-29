@@ -13,8 +13,10 @@ import { toRelativePath } from "./path-utils";
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
 import {
   composeReviewPrompt,
+  profileHasCustomSection,
   type ResolvedReviewProfile,
 } from "@plannotator/shared/review-profiles";
+import { renderAxisChecklist } from "@plannotator/shared/review-axes";
 import { classifyFindingPlacement } from "@plannotator/shared/external-annotation";
 
 // ---------------------------------------------------------------------------
@@ -175,15 +177,22 @@ The finding description should be one paragraph.`;
 /**
  * Compose Codex's review prompt: the immutable system prompt, the resolved
  * profile's Custom Review Profile section (omitted for builtin:default), then
- * the user review message. For builtin:default / no profile the output is
- * byte-identical to today's
- * `CODEX_REVIEW_SYSTEM_PROMPT + "\n\n---\n\n" + userMessage`.
+ * the user review message.
+ *
+ * Tavernpunk fork: the built-in default additionally carries the required
+ * review axes (@plannotator/shared/review-axes), appended AFTER the system
+ * prompt rather than edited into it — that block is copied verbatim from
+ * codex-rs and is kept byte-identical to upstream so it can be re-synced.
+ * A custom review profile replaces the methodology outright and is left alone.
  */
 export function composeCodexReviewPrompt(
   userMessage: string,
   reviewProfile?: ResolvedReviewProfile,
 ): string {
-  return composeReviewPrompt(CODEX_REVIEW_SYSTEM_PROMPT, reviewProfile, userMessage);
+  const systemPrompt = profileHasCustomSection(reviewProfile)
+    ? CODEX_REVIEW_SYSTEM_PROMPT
+    : `${CODEX_REVIEW_SYSTEM_PROMPT}\n\n${renderAxisChecklist()}`;
+  return composeReviewPrompt(systemPrompt, reviewProfile, userMessage);
 }
 
 // ---------------------------------------------------------------------------

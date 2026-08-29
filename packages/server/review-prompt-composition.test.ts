@@ -7,6 +7,7 @@ import {
   BUILTIN_DEFAULT_ID,
   type ResolvedReviewProfile,
 } from "@plannotator/shared/review-profiles";
+import { renderAxisChecklist } from "@plannotator/shared/review-axes";
 
 // Stand-in for buildAgentReviewUserMessage(...) output. The composer treats it
 // as opaque text, so a literal is enough to pin placement and byte-equality.
@@ -19,9 +20,18 @@ const security: ResolvedReviewProfile = {
   source: "user",
 };
 
-// The exact prompt today, before this phase, for the default path.
+// The exact default prompt for each engine.
+//
+// Tavernpunk fork: the built-in default additionally carries the required
+// review axes (@plannotator/shared/review-axes). The two engines embed them
+// differently on purpose — Claude's roster IS the axes, so they live inside
+// CLAUDE_REVIEW_PROMPT, while Codex's system block is kept byte-identical to
+// upstream codex-rs and the axes are appended after it. These constants encode
+// that, so the tests below still pin what they always pinned: the default path
+// is deterministic, and a custom profile never leaks into it.
 const claudeDefault = CLAUDE_REVIEW_PROMPT + "\n\n---\n\n" + userMessage;
-const codexDefault = CODEX_REVIEW_SYSTEM_PROMPT + "\n\n---\n\n" + userMessage;
+const codexDefault =
+  CODEX_REVIEW_SYSTEM_PROMPT + "\n\n" + renderAxisChecklist() + "\n\n---\n\n" + userMessage;
 
 describe("review prompt composition — default is byte-identical", () => {
   test("Claude: absent profile matches today's prompt exactly", () => {

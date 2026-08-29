@@ -3,6 +3,10 @@ import {
   type ResolvedReviewProfile,
 } from "@plannotator/shared/review-profiles";
 import {
+  axisAgentCount,
+  renderAxisAgentRoster,
+} from "@plannotator/shared/review-axes";
+import {
   transformSeverityFindings,
   type ReviewSeverity,
   type ReviewFinding,
@@ -85,6 +89,15 @@ export const CLAUDE_REVIEW_SCHEMA_JSON = JSON.stringify({
 // Review prompt — converges open-source Claude Code review + remote service
 // ---------------------------------------------------------------------------
 
+// Tavernpunk fork: the required review axes
+// (@plannotator/shared/review-axes) ARE this prompt's parallel agent roster.
+// Claude's default review is the one engine that already fans out subagents,
+// so rendering one agent per axis is what actually guarantees each axis gets
+// exercised — an appended checklist would leave performance and test coverage
+// unowned, since none of the four original agents covered them.
+const AXIS_AGENT_ROSTER = renderAxisAgentRoster(1);
+const AXIS_AGENT_COUNT = axisAgentCount();
+
 export const CLAUDE_REVIEW_PROMPT = `# Claude Code Review System Prompt
 
 ## Identity
@@ -101,29 +114,14 @@ Step 1: Gather context
   - Build a map of which rules apply to which file paths
   - Identify any skip rules (paths, patterns, or file types to ignore)
 
-Step 2: Launch 4 parallel review agents
+Step 2: Launch ${AXIS_AGENT_COUNT + 1} parallel review agents
+  One per required review axis, plus guideline compliance. Every agent
+  runs. An agent whose axis turns up nothing real reports nothing — do
+  not pad an axis to look thorough.
 
-  Agent 1 — Bug + Regression (Opus-level reasoning)
-    Scan for logic errors, regressions, broken edge cases, build failures,
-    and code that will produce wrong results. Focus on the diff but read
-    surrounding code to understand call sites and data flow. Flag only
-    issues where the code is demonstrably wrong — not stylistic concerns,
-    not missing tests, not "could be cleaner."
+${AXIS_AGENT_ROSTER}
 
-  Agent 2 — Security + Deep Analysis (Opus-level reasoning)
-    Look for security vulnerabilities with concrete exploit paths, race
-    conditions, incorrect assumptions about trust boundaries, and subtle
-    issues in introduced code. Read surrounding code for context. Do not
-    flag theoretical risks without a plausible path to harm.
-
-  Agent 3 — Code Quality + Reusability (Sonnet-level reasoning)
-    Look for code smells, unnecessary duplication, missed opportunities to
-    reuse existing utilities or patterns in the codebase, overly complex
-    implementations that could be simpler, and elegance issues. Read the
-    surrounding codebase to understand existing patterns before flagging.
-    Only flag issues a senior engineer would care about.
-
-  Agent 4 — Guideline Compliance (Haiku-level reasoning)
+  Agent ${AXIS_AGENT_COUNT + 1} — Guideline Compliance
     Audit changes against rules from CLAUDE.md and REVIEW.md gathered in
     Step 1. Only flag clear, unambiguous violations where you can cite the
     exact rule broken. If a PR makes a CLAUDE.md statement outdated, flag
@@ -177,7 +175,9 @@ Step 6: Return structured JSON output matching the schema.
 ## Hard constraints
 - Never approve or block the PR
 - Never comment on formatting or code style unless guidance files say to
-- Never flag missing test coverage unless guidance files say to
+- Missing test coverage is in scope, but only as the Test Coverage axis
+  defines it: the logic this change introduces or alters. Never audit
+  pre-existing coverage or ask for tests on trivial or mechanical changes
 - Never invent rules — only enforce what CLAUDE.md or REVIEW.md state
 - Never flag issues in skipped paths or generated files unless guidance
   explicitly includes them

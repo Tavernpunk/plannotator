@@ -2,6 +2,7 @@ import {
   profileHasCustomSection,
   type ResolvedReviewProfile,
 } from "@plannotator/shared/review-profiles";
+import { renderAxisChecklist } from "@plannotator/shared/review-axes";
 import {
   transformSeverityFindings,
   type ReviewSeverity,
@@ -1169,10 +1170,11 @@ breaks, and why it isn't already handled.
 
 ## Do NOT report
   - Formatting, naming, or style preferences (unless a repo guideline requires).
-  - "Consider adding tests" — unless the change adds non-trivial logic with no
-    test coverage at all.
   - Hypothetical problems needing exotic conditions with no real code path.
-  - Speculative refactors or "this could be cleaner" outside the change's scope.
+  - Refactors of code this change did not touch. Simplification findings must be
+    about the changed code itself (see the Scope + Simplification axis).
+  - Missing tests for trivial or mechanical changes, or gaps in pre-existing
+    coverage (see the Test Coverage axis for what IS in scope).
 
 ## Hard constraints
 - This is a read-only review. Do NOT modify files.
@@ -1258,9 +1260,12 @@ export function composeMarkerReviewPrompt(
   userMessage: string,
   nonce: string,
 ): string {
+  // Tavernpunk fork: the built-in methodology additionally carries the required
+  // review axes. A custom profile replaces the methodology outright and gets
+  // only the output contract, exactly as before.
   const head = profileHasCustomSection(profile)
     ? (profile as ResolvedReviewProfile).instructions.trim()
-    : MARKER_REVIEW_METHODOLOGY;
+    : MARKER_REVIEW_METHODOLOGY + "\n\n" + renderAxisChecklist();
   return head + "\n\n" + buildMarkerOutputContract(nonce) + "\n\n---\n\n" + userMessage;
 }
 
