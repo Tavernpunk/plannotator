@@ -2,18 +2,26 @@
  * Review Axes — the fixed set of dimensions every built-in review must cover.
  *
  * Tavernpunk fork addition. Plannotator ships a different default methodology
- * per engine family (Claude fans out parallel subagents, Codex runs OpenAI's
- * verbatim `codex-rs/core/review_prompt.md`, the marker engines run a
- * single-pass investigation prompt), and those three disagree about what is in
- * scope: none of them mentions performance, Claude's hard constraints forbid
- * flagging missing test coverage, and the marker prompt lists "consider adding
- * tests" and "this could be cleaner" under Do NOT report.
+ * per engine family (Codex runs OpenAI's verbatim
+ * `codex-rs/core/review_prompt.md`, the marker engines run a single-pass
+ * investigation prompt, Claude runs our own single-pass prompt), and those
+ * three disagreed about what is in scope: none of them mentioned performance,
+ * Claude's hard constraints forbade flagging missing test coverage, and the
+ * marker prompt listed "consider adding tests" and "this could be cleaner"
+ * under Do NOT report.
  *
  * So the axes cannot simply be appended — an axis the surrounding prompt
- * forbids is dead text. This module owns the axis list ONCE; each engine's
- * composer renders it in the shape that engine's prompt actually uses, and the
- * suppressing constraints are amended at their source (see claude-review.ts's
- * hard constraints and marker-review.ts's "Do NOT report" list).
+ * forbids is dead text. This module owns the axis list ONCE, every engine now
+ * renders it with `renderAxisChecklist`, and the suppressing constraints are
+ * amended at their source (see claude-review.ts's hard constraints and
+ * marker-review.ts's "Do NOT report" list).
+ *
+ * Claude's prompt used to render the axes as a parallel subagent roster
+ * instead, one agent per axis. That was dropped along with the fan-out: the
+ * roster guaranteed coverage by paying for the diff and the repo's guidance
+ * files once per axis, which is why Claude reviews cost several times what the
+ * other engines cost. One pass that holds all six axes in mind covers them for
+ * one context.
  *
  * Scope: the BUILT-IN default review, on every engine. A custom review skill
  * (docs/custom-reviews.md) deliberately replaces the methodology wholesale —
@@ -25,9 +33,9 @@
  */
 
 export interface ReviewAxis {
-  /** Stable id, used by tests and by the per-engine renderers. */
+  /** Stable id, used by tests and by the checklist renderer. */
   id: string;
-  /** Short name, becomes the agent name on Claude and the bullet on the rest. */
+  /** Short name, becomes the checklist bullet's lead-in. */
   title: string;
   /** What this axis is responsible for. One paragraph, no line breaks. */
   focus: string;
@@ -76,58 +84,17 @@ export const REVIEW_AXES: readonly ReviewAxis[] = [
   },
 ];
 
-/** Preamble shared by both renderings, so the requirement reads the same way. */
+/** Preamble, so the requirement reads the same way on every engine. */
 const AXES_MANDATE =
   "Cover every axis below. They are required scope for this review, and they override any narrower framing earlier in these instructions — including anything that tells you not to raise performance or missing-test findings. An axis that turns up nothing real contributes nothing: report no finding for it rather than inventing one. Everything you do report still has to clear the evidence bar above.";
 
 /**
- * Checklist rendering — for engines whose default prompt is a single pass of
- * prose (Codex, and the marker engines). Appended after the engine's own
- * methodology so it reads as additional required scope.
+ * Checklist rendering — the one rendering, used by every engine. Each default
+ * prompt is a single pass of prose (Claude's own, Codex's upstream block, the
+ * marker methodology), and the checklist is placed after that methodology so it
+ * reads as additional required scope.
  */
 export function renderAxisChecklist(): string {
   const items = REVIEW_AXES.map((axis) => `- **${axis.title}.** ${axis.focus}`).join("\n");
   return `## Required review axes\n\n${AXES_MANDATE}\n\n${items}`;
-}
-
-/**
- * Agent-roster rendering — for Claude, whose default prompt already fans out
- * parallel subagents. One agent per axis guarantees the axis is actually
- * exercised, which an appended checklist would not: the four original agents
- * cover correctness, security and quality, and nothing would own performance
- * or test coverage.
- *
- * `startIndex` is the first agent number, so the caller can keep its own
- * additional agents (guideline compliance) numbered after these.
- */
-export function renderAxisAgentRoster(startIndex = 1): string {
-  return REVIEW_AXES.map((axis, i) =>
-    [`  Agent ${startIndex + i} — ${axis.title}`, indentWrap(axis.focus, 4, 72)].join("\n"),
-  ).join("\n\n");
-}
-
-/** The agent number following the axis roster. */
-export function axisAgentCount(): number {
-  return REVIEW_AXES.length;
-}
-
-/**
- * Greedy word wrap at `width` columns with a fixed indent — matches the hand
- * formatting of the surrounding prompt so the rendered roster is not visually
- * distinguishable from the prose around it.
- */
-function indentWrap(text: string, indent: number, width: number): string {
-  const pad = " ".repeat(indent);
-  const lines: string[] = [];
-  let line = "";
-  for (const word of text.split(/\s+/)) {
-    if (line && pad.length + line.length + 1 + word.length > width) {
-      lines.push(pad + line);
-      line = word;
-    } else {
-      line = line ? `${line} ${word}` : word;
-    }
-  }
-  if (line) lines.push(pad + line);
-  return lines.join("\n");
 }

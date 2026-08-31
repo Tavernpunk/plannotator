@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { REVIEW_AXES, renderAxisChecklist, renderAxisAgentRoster, axisAgentCount } from "@plannotator/shared/review-axes";
-import { CLAUDE_REVIEW_PROMPT, composeClaudeReviewPrompt } from "./claude-review";
+import { REVIEW_AXES, renderAxisChecklist } from "@plannotator/shared/review-axes";
+import { CLAUDE_REVIEW_PROMPT, buildClaudeCommand, composeClaudeReviewPrompt } from "./claude-review";
 import { composeCodexReviewPrompt } from "./codex-review";
 import { composeMarkerReviewPrompt } from "./marker-review";
 import type { ResolvedReviewProfile } from "@plannotator/shared/review-profiles";
@@ -44,7 +44,7 @@ describe("axis catalog", () => {
   test("every axis carries a non-trivial focus on one line", () => {
     for (const axis of REVIEW_AXES) {
       expect(axis.title.length).toBeGreaterThan(0);
-      // A one-line focus is what lets the roster renderer control its own wrap.
+      // One line per focus keeps the rendered checklist one bullet per axis.
       expect(axis.focus).not.toContain("\n");
       expect(axis.focus.length).toBeGreaterThan(80);
     }
@@ -72,7 +72,8 @@ describe("every default review prompt covers every axis", () => {
 describe("suppressions that would nullify an axis stay lifted", () => {
   test("Claude no longer forbids flagging missing test coverage", () => {
     // The stock hard constraint read "Never flag missing test coverage unless
-    // guidance files say to", which would have made Agent 6 a no-op.
+    // guidance files say to", which would have made the Test Coverage axis a
+    // no-op wherever it appeared.
     expect(CLAUDE_REVIEW_PROMPT).not.toContain("Never flag missing test coverage");
     expect(CLAUDE_REVIEW_PROMPT).toContain("Missing test coverage is in scope");
   });
@@ -83,22 +84,42 @@ describe("suppressions that would nullify an axis stay lifted", () => {
   });
 });
 
-describe("Claude renders the axes as its parallel agent roster", () => {
+describe("Claude's default review is a single pass", () => {
+  /**
+   * The failure this guards: the subagent fan-out coming back. Claude's prompt
+   * used to launch one review agent per axis and then one validation agent per
+   * candidate finding, which paid for the diff and this repo's guidance files
+   * once per agent — several times the tokens and wall clock of the other
+   * engines for comparable coverage. Coverage now comes from the shared
+   * checklist inside one pass, and the command withholds the Agent tool so a
+   * model that finds a big diff daunting cannot re-introduce the fan-out on its
+   * own initiative.
+   */
   const prompt = composeClaudeReviewPrompt("USER", undefined);
 
-  test("one agent per axis, plus guideline compliance, numbered in order", () => {
-    // An appended checklist would leave performance and test coverage unowned;
-    // Claude's review only actually executes what its roster names.
-    REVIEW_AXES.forEach((axis, i) => {
-      expect(prompt).toContain(`Agent ${i + 1} — ${axis.title}`);
-    });
-    expect(prompt).toContain(`Agent ${axisAgentCount() + 1} — Guideline Compliance`);
-    expect(prompt).toContain(`Launch ${axisAgentCount() + 1} parallel review agents`);
+  test("the axes arrive as the shared checklist, not a roster", () => {
+    expect(prompt).toContain(renderAxisChecklist());
+    expect(prompt).not.toMatch(/Agent \d+ —/);
+    expect(prompt).not.toContain("parallel review agents");
+    expect(prompt).not.toContain("validation agent");
   });
 
-  test("the roster count in the prose tracks the catalog", () => {
-    // A hardcoded "Launch 7" would go stale the moment an axis is added.
-    expect(renderAxisAgentRoster(1).match(/Agent \d+ —/g)).toHaveLength(REVIEW_AXES.length);
+  test("guideline compliance survives the roster's removal", () => {
+    // It was Agent 7. Dropping the roster must not drop the axis-adjacent scope
+    // that only that agent carried.
+    expect(prompt).toContain("## Guideline compliance");
+    expect(prompt).toContain("cite the exact rule broken");
+  });
+
+  test("the review command grants no subagent tool", () => {
+    const command = buildClaudeCommand("review").command;
+    const tools = command[command.indexOf("--tools") + 1];
+    const allowed = command[command.indexOf("--allowedTools") + 1];
+    const disallowed = command[command.indexOf("--disallowedTools") + 1];
+
+    expect(tools.split(",")).not.toContain("Agent");
+    expect(allowed.split(",")).not.toContain("Agent");
+    expect(disallowed.split(",")).toContain("Agent");
   });
 });
 

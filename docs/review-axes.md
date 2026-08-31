@@ -34,9 +34,20 @@ the suppressing constraints were amended at their source.
 
 | Engine | How the axes are embedded |
 |--------|---------------------------|
-| Claude | **As the parallel agent roster.** Its default prompt already fans out subagents, so Step 2 launches one agent per axis plus the original Guideline Compliance agent. An appended checklist would have left performance and test coverage unowned — the four stock agents covered neither. |
+| Claude | **Embedded as a checklist** in the middle of `CLAUDE_REVIEW_PROMPT` — that prompt is ours, so it is edited in place rather than appended to. Guideline compliance, formerly its own agent, is a section of the same single pass. |
 | Codex | **Appended as a checklist** after the system block. That block is copied verbatim from `codex-rs/core/review_prompt.md` and is kept byte-identical to upstream so it can be re-synced, so it is never edited in place. |
 | Cursor / OpenCode / Pi / Copilot | **Appended as a checklist** after the methodology and before the marker output contract. |
+
+Claude originally rendered the axes as a **parallel subagent roster** instead:
+its stock prompt fanned out four agents, so the fork made that one agent per
+axis plus Guideline Compliance, and Step 3 then launched one validation agent
+per candidate finding. That guaranteed coverage by paying for the diff and the
+repo's guidance files once per agent, across two sequential waves — which is why
+Claude reviews cost several times what Codex and the marker engines cost in both
+tokens and wall clock for comparable coverage. It is now one pass like every
+other engine, and `buildClaudeCommand` withholds the `Agent` tool (absent from
+`--tools` and `--allowedTools`, named in `--disallowedTools`) so a model facing a
+large diff cannot re-introduce the fan-out on its own initiative.
 
 The checklist carries an explicit override line, because Codex's upstream
 prompt is bug-focused and tells the model to prefer reporting nothing — without
@@ -57,6 +68,7 @@ branch in each composer — one line per engine.
 ## Adding or changing an axis
 
 Edit `REVIEW_AXES` in `packages/shared/review-axes.ts`. Keep `focus` on a single
-line (the roster renderer controls its own wrapping). `packages/server/review-axes.test.ts`
+line, so the rendered checklist stays one bullet per axis. `packages/server/review-axes.test.ts`
 asserts every axis reaches all three engine families, so a half-wired axis fails
-the suite rather than silently narrowing reviews.
+the suite rather than silently narrowing reviews. It also pins that Claude's
+review stays a single pass with no subagent tool.

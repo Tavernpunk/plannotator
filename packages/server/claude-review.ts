@@ -2,10 +2,7 @@ import {
   composeReviewPrompt,
   type ResolvedReviewProfile,
 } from "@plannotator/shared/review-profiles";
-import {
-  axisAgentCount,
-  renderAxisAgentRoster,
-} from "@plannotator/shared/review-axes";
+import { renderAxisChecklist } from "@plannotator/shared/review-axes";
 import {
   transformSeverityFindings,
   type ReviewSeverity,
@@ -90,13 +87,19 @@ export const CLAUDE_REVIEW_SCHEMA_JSON = JSON.stringify({
 // ---------------------------------------------------------------------------
 
 // Tavernpunk fork: the required review axes
-// (@plannotator/shared/review-axes) ARE this prompt's parallel agent roster.
-// Claude's default review is the one engine that already fans out subagents,
-// so rendering one agent per axis is what actually guarantees each axis gets
-// exercised — an appended checklist would leave performance and test coverage
-// unowned, since none of the four original agents covered them.
-const AXIS_AGENT_ROSTER = renderAxisAgentRoster(1);
-const AXIS_AGENT_COUNT = axisAgentCount();
+// (@plannotator/shared/review-axes) are appended here as a checklist, the same
+// rendering Codex and the marker engines get.
+//
+// This prompt used to fan out — one subagent per axis, then one validation
+// subagent per candidate finding. That bought axis coverage with two sequential
+// waves of cold-context subagents, each re-reading the diff and the repo's
+// guidance files, which made Claude reviews cost several times what Codex and
+// the marker engines cost in both tokens and wall clock for comparable
+// coverage. The axes are required scope either way; a single pass that holds
+// all six in mind while it reads each hunk once covers them without paying for
+// the same context six times. `buildClaudeCommand` withholds the Agent tool so
+// the fan-out cannot come back by model initiative.
+const AXIS_CHECKLIST = renderAxisChecklist();
 
 export const CLAUDE_REVIEW_PROMPT = `# Claude Code Review System Prompt
 
@@ -105,46 +108,51 @@ You are a code review system. Your job is to find bugs that would break
 production. You are not a linter, formatter, or style checker unless
 project guidance files explicitly expand your scope.
 
-## Pipeline
+## Method
+Review the change yourself, in ONE pass. You have no subagents — do not try to
+delegate. Hold every required axis below in mind as you read, so one read of a
+hunk answers all of them, and spend your reading budget on the changes that
+could actually be wrong rather than on uniform coverage of the diff.
 
-Step 1: Gather context
-  - Retrieve the PR diff or local diff (gh pr diff, git diff, or jj diff)
-  - Read CLAUDE.md and REVIEW.md at the repo root and in every directory
-    containing modified files
-  - Build a map of which rules apply to which file paths
-  - Identify any skip rules (paths, patterns, or file types to ignore)
+Step 1: Gather context, cheaply
+  - Read the diff once (gh pr diff, git diff, or jj diff).
+  - Read the guidance that governs the changed paths: CLAUDE.md, AGENTS.md,
+    and REVIEW.md at the repo root and in the directories holding modified
+    files. When one of those files is large, grep it for the changed paths and
+    the subsystems they belong to instead of reading it end to end.
+  - Note the skip rules (paths, patterns, file types to ignore) before you
+    start reading code, so you never spend a read on an excluded path.
 
-Step 2: Launch ${AXIS_AGENT_COUNT + 1} parallel review agents
-  One per required review axis, plus guideline compliance. Every agent
-  runs. An agent whose axis turns up nothing real reports nothing — do
-  not pad an axis to look thorough.
+Step 2: Review the diff against every required axis
+  Go file by file. For each change that could plausibly be wrong:
+  - Read the enclosing function and module, not just the hunk.
+  - Trace its call sites and data flow — grep for callers before claiming a
+    contract broke or a value cannot be null.
+  - Check sibling code and tests: is the pattern you are about to flag used
+    safely elsewhere, or the failure path already covered?
+  Skip what carries no risk — comments, generated files, mechanical renames,
+  pure formatting. Re-read a file only when a specific suspicion needs it.
 
-${AXIS_AGENT_ROSTER}
+Step 3: Confirm each candidate the moment you form it
+  Do not collect candidates and audit them afterwards.
+  - Trace the actual path that triggers the issue.
+  - Check whether it is already handled: a guard, try/catch, fallback,
+    upstream validation, or a type-system guarantee.
+  - If you cannot show how it triggers, drop it. Prefer silence over a false
+    positive.
+  What you establish while confirming it IS the \`reasoning\` field: what
+  triggers it, what breaks, and why it is not already handled.
 
-  Agent ${AXIS_AGENT_COUNT + 1} — Guideline Compliance
-    Audit changes against rules from CLAUDE.md and REVIEW.md gathered in
-    Step 1. Only flag clear, unambiguous violations where you can cite the
-    exact rule broken. If a PR makes a CLAUDE.md statement outdated, flag
-    that the docs need updating. Respect all skip rules — never flag files
-    or patterns that guidance says to ignore.
+${AXIS_CHECKLIST}
 
-  All agents:
-  - Do not duplicate each other's findings
-  - Do not flag issues in paths excluded by guidance files
-  - Provide file, line number, and a concise description for each candidate
+## Guideline compliance
+Also flag clear, unambiguous violations of the guidance files from Step 1, and
+cite the exact rule broken. If the change makes a documented statement
+outdated, flag that the docs need updating. Respect every skip rule — never
+flag files or patterns the guidance says to ignore.
 
-Step 3: Validate each candidate finding
-  For each candidate, launch a validation agent. The validator:
-  - Traces the actual code path to confirm the issue is real
-  - Checks whether the issue is handled elsewhere (try/catch, upstream
-    guard, fallback logic, type system guarantees)
-  - Confirms the finding is not a false positive with high confidence
-  - If validation fails, drop the finding silently
-  - If validation passes, write a clear reasoning chain explaining how
-    the issue was confirmed — this becomes the \`reasoning\` field
-
-Step 4: Classify each validated finding
-  Assign exactly one severity:
+## Severity
+Assign exactly one severity per finding:
 
   important — A bug that should be fixed before merging. Build failures,
     clear logic errors, security vulnerabilities with exploit paths, data
@@ -159,18 +167,18 @@ Step 4: Classify each validated finding
     NOT introduced by this PR. Only flag when directly relevant to the
     changed code path.
 
-Step 5: Deduplicate and rank
-  - Merge findings that describe the same underlying issue from different
-    agents — keep the most specific description and the highest severity
-  - Sort by severity: important → nit → pre_existing
-  - Within each severity, sort by file path and line number
-
-Step 6: Return structured JSON output matching the schema.
-  Place each finding by how specific it is: give file and line for a line-level
-  issue; give file and set line null for a whole-file issue; set file and line
-  null for a general, review-level note. Never invent a line you are unsure of —
-  drop to a file or general placement instead of guessing.
-  If no issues are found, return an empty findings array with zeroed summary.
+## Output
+Return structured JSON output matching the schema.
+  - Merge findings that describe the same underlying issue — keep the most
+    specific description and the highest severity.
+  - Sort by severity (important → nit → pre_existing), then by file path and
+    line number.
+  - Place each finding by how specific it is: give file and line for a
+    line-level issue; give file and set line null for a whole-file issue; set
+    file and line null for a general, review-level note. Never invent a line
+    you are unsure of — drop to a file or general placement instead of
+    guessing.
+  - If no issues are found, return an empty findings array with zeroed summary.
 
 ## Hard constraints
 - Never approve or block the PR
@@ -178,10 +186,11 @@ Step 6: Return structured JSON output matching the schema.
 - Missing test coverage is in scope, but only as the Test Coverage axis
   defines it: the logic this change introduces or alters. Never audit
   pre-existing coverage or ask for tests on trivial or mechanical changes
-- Never invent rules — only enforce what CLAUDE.md or REVIEW.md state
+- Never invent rules — only enforce what CLAUDE.md, AGENTS.md or REVIEW.md state
 - Never flag issues in skipped paths or generated files unless guidance
   explicitly includes them
 - Prefer silence over false positives — when in doubt, drop the finding
+- This is a read-only review. Do NOT modify files
 - Do NOT post any comments to GitHub or GitLab
 - Do NOT use gh pr comment or any commenting tool
 - Your only output is the structured JSON findings`;
@@ -216,10 +225,19 @@ export interface ClaudeCommandResult {
 /**
  * Build the `claude -p` command. Prompt is passed via stdin, not as a
  * positional arg — avoids quoting issues, argv limits, and variadic flag conflicts.
+ *
+ * Tavernpunk fork: the Agent tool is deliberately withheld (absent from
+ * `--tools` and `--allowedTools`, and named in `--disallowedTools` so an
+ * attempted delegation fails loudly rather than silently). CLAUDE_REVIEW_PROMPT
+ * is a single pass, matching Codex and the marker engines, and subagents were
+ * the whole reason Claude reviews cost several times what those engines cost:
+ * each one starts cold and re-reads the diff plus this repo's guidance files.
+ * Prompt text alone would not hold — a model that finds a large diff daunting
+ * reaches for parallelism on its own initiative.
  */
 export function buildClaudeCommand(prompt: string, model: string = "claude-opus-5", effort?: string, binary?: string): ClaudeCommandResult {
   const allowedTools = [
-    "Agent", "Read", "Glob", "Grep",
+    "Read", "Glob", "Grep",
     // GitHub CLI
     "Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr list:*)",
     "Bash(gh issue view:*)", "Bash(gh issue list:*)",
@@ -242,6 +260,7 @@ export function buildClaudeCommand(prompt: string, model: string = "claude-opus-
   ].join(",");
 
   const disallowedTools = [
+    "Agent",
     "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
     "Bash(python:*)", "Bash(python3:*)", "Bash(node:*)", "Bash(npx:*)",
     "Bash(bun:*)", "Bash(bunx:*)", "Bash(sh:*)", "Bash(bash:*)", "Bash(zsh:*)",
@@ -259,7 +278,7 @@ export function buildClaudeCommand(prompt: string, model: string = "claude-opus-
       "--no-session-persistence",
       "--model", model,
       ...(effort ? ["--effort", effort] : []),
-      "--tools", "Agent,Bash,Read,Glob,Grep",
+      "--tools", "Bash,Read,Glob,Grep",
       "--allowedTools", allowedTools,
       "--disallowedTools", disallowedTools,
     ],
