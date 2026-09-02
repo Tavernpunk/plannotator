@@ -144,7 +144,8 @@ claude --plugin-dir ./apps/hook
 | `PLANNOTATOR_PASTE_URL` | Base URL of the paste service API for short URL sharing. Default: `https://plannotator-paste.plannotator.workers.dev`. |
 | `PLANNOTATOR_ORIGIN` | Explicit agent-origin override at the top of the detection chain. Valid values: `claude-code`, `amp`, `droid`, `opencode`, `codex`, `copilot-cli`, `gemini-cli`, `kiro-cli`, `pi`, `oh-my-pi`. Invalid values silently fall through to env-based detection. Unset by default. |
 | `PLANNOTATOR_JINA` | Set to `0` / `false` to disable Jina Reader for URL annotation, or `1` / `true` to enable. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "jina": false }`) or per-invocation via `--no-jina`. |
-| `PLANNOTATOR_ANNOTATE_HISTORY` | Set to `0` / `false` to disable ALL annotate-session writes to the data dir: per-file version history (no copies of annotated files are written; the annotate version diff is unavailable) AND the durable submitted-feedback records (#678) that single-local-file annotate sessions otherwise write to `history/{project}/{slug}/submissions/` before deleting the draft on submit. Disabling it keeps annotate sessions fully stateless but also gives up that submit crash-recovery record. URL and annotate-last sessions never write either kind of data regardless of this flag. Folder sessions write no submitted-feedback records, but they do participate in per-file version history: the first time a session serves a file through /api/doc it snapshots that file (lazily, memoized per resolved path for the life of the server), which is what powers the per-file version diff when a folder file is reopened later; setting this flag to 0 disables those folder snapshots too. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "annotateHistory": false }`); the env var takes precedence. |
+| `PLANNOTATOR_ANNOTATE_HISTORY` | Set to `0` / `false` to disable ALL annotate-session writes to the data dir: per-file version history (no copies of annotated files are written; the annotate version diff is unavailable) AND the durable submitted-feedback records (#678) that single-local-file annotate sessions otherwise write to `history/{project}/{slug}/submissions/` before deleting the draft on submit. Disabling it keeps annotate sessions fully stateless but also gives up that submit crash-recovery record. URL and annotate-last sessions never write either kind of data regardless of this flag. Folder sessions write no submitted-feedback records, but they do participate in per-file version history: the first time a session serves a file through /api/doc it snapshots that file (lazily, memoized per resolved path for the life of the server), which is what powers the per-file version diff when a folder file is reopened later; setting this flag to 0 disables those folder snapshots too. Setting it to 0 additionally suppresses **feedback archive** records for every annotate surface (single file, folder, URL, live app, annotate-last), so "fully stateless annotate session" stays literally true regardless of `PLANNOTATOR_FEEDBACK_HISTORY`. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "annotateHistory": false }`); the env var takes precedence. |
+| `PLANNOTATOR_FEEDBACK_HISTORY` | Set to `0` / `false` to stop archiving submitted feedback under `~/.plannotator/feedback/` (or `PLANNOTATOR_DATA_DIR`). Default: enabled, which appends one record per submission at decision-settlement time on all three surfaces and in both runtimes: plan approve/deny, code review Send Feedback / Approve (LGTM) / Close, and every annotate submit / approve / close. A review posted straight to GitHub or GitLab with `POST /api/pr-action` is delivered to the platform and is not archived locally yet. **Note that this writes the user's own feedback text, the document and code excerpts it quotes, and per-annotation metadata to disk, and nothing prunes the directory** (same policy as `plans/`, `history/`, and `guides/`); delete `~/.plannotator/feedback/` or a project subdirectory to forget, or set this to 0 to never write. Code-review records carry diff IDENTITY only (vcsType, diffType, base, gitRef, snapshotId, cwd, PR metadata, changed-file count, patch byte count), never the patch bytes; plan records carry the decision text plus a reference to the `history/{project}/{slug}/NNN.md` version the decision was made on, never a second copy of the plan. Externally sourced annotations (linters, review agents, WebMCP browser agents) are included but keep their `source` / `author` tags, so `source == null` selects the reviewer's own comments; agent job outputs (guides, tours) are not archived. This knob governs only the new archive: the `planSave` decision snapshots in `plans/` and the #678 annotate submission records under `history/` are unaffected. Annotate surfaces honor `PLANNOTATOR_ANNOTATE_HISTORY` as well. Can also be set via `~/.plannotator/config.json` (`{ "feedbackHistory": false }`); the env var takes precedence. |
 | `PLANNOTATOR_GUIDE_VIEWER_URL` | Base URL of the portable Guided Review viewer that exported guides pin (default `https://guides.show/v1/`). Must be `https:` (or `http:` on localhost for local viewer builds — `bun run --cwd apps/guides-show serve:local`); anything else is ignored. Read by the export endpoints of both servers and by `plannotator guide export` (which also accepts `--viewer-url`). |
 | `PLANNOTATOR_GUIDE_SHARE_URL` | Base URL of the guide host that Guided Review share links are created on: the review UI's "Create share link", `plannotator guide share`, and `plannotator guide unshare` upload to and delete from it (default `https://guides.show`; the origin of your own deployment of its Cloudflare Worker otherwise, see the `apps/guides-show` README). Must be `http(s)`; credentials, query and fragment are dropped and a trailing slash is trimmed; an invalid value warns once on stderr and falls back to the default so a share setting can never break a server launch or CLI run. An empty-but-set env var counts as unset. Can also be set via `~/.plannotator/config.json` (`{ "guideShareUrl": "https://guides.example.com" }`); the env var takes precedence; there is no per-invocation flag. Resolved by `resolveGuideShareUrl` in `packages/shared/config.ts`. Whether sharing is allowed at all is `PLANNOTATOR_SHARE` (`disabled` turns guide share links off entirely). Removal always goes to the host a saved guide's record names, never merely the currently configured URL, so changing this after sharing does not strand a link. |
 | `PLANNOTATOR_GUIDE_HISTORY` | Set to `0` / `false` to disable persisting successful Guided Reviews (no guide copies are written to the data dir; the "Previous guides" list is then never populated, though already-saved guides remain readable and listed). **Note that a persisted guide includes a full copy of the diff it was generated against** — `history/.../guides/{id}.patch` beside the `{id}.json` envelope, uncapped, as large as the diff — because that patch is what a later portable export or share link renders (the diff is captured when the guide job launches, never re-read from the working tree). Deleting a guide removes both files; nothing prunes the directory otherwise. Turning this flag off skips the patch copy too, at the cost of exports and share links for guides from that session once the server exits. Default: enabled. Can also be set via `~/.plannotator/config.json` (`{ "guideHistory": false }`); the env var takes precedence. |
@@ -267,6 +268,8 @@ Ask AI providers are detected independently from installed/authenticated local C
 Automatic resolution is session-only and never writes a preference. Explicit per-origin choices are persisted in cookies, so a user can override the automatic match for one agent without changing the default for another.
 
 > **Codex transport note:** the `codex-sdk` provider id is a stable identifier only — it no longer uses `@openai/codex-sdk` / `codex exec`. It drives a long-lived `codex app-server` process over JSON-RPC (`packages/ai/providers/codex-app-server.ts`), which respects the user's/enterprise-managed approval policy and supports interactive Allow/Deny approvals. The id stays `codex-sdk` to preserve saved cookie preferences, the `agents.ts` mapping, and the UI reasoning-effort gate.
+
+> **OpenCode transport note:** the `opencode-sdk` provider spawns its own `opencode serve` per process on an OS-assigned port (`port: 0`) and never attaches to a server it did not spawn (an attached server can't be cleaned up by us, and opencode's per-directory instances accumulate in it without eviction). The spawned server is closed on dispose and on process exit. Model discovery is deferred behind the provider initializer (`?activate=` from the model picker, or the first opencode session) exactly like Codex — nothing spawns at server boot, so the picker lists opencode with an empty model list until first activation. Regression-pinned by `packages/ai/providers/opencode-sdk.test.ts`.
 
 ## Annotate Flow
 
@@ -514,6 +517,111 @@ This powers the version history API (`/api/plan/version`, `/api/plan/versions`) 
 
 History saves independently of the `planSave` user setting (which controls decision snapshots in `~/.plannotator/plans/`). Storage functions live in `packages/shared/storage.ts` (runtime-agnostic, re-exported by `packages/server/storage.ts`). Pi copies the shared files at build time. Slug format: `{sanitized-heading}-YYYY-MM-DD` (heading first for readability).
 
+## Feedback Archive
+
+Every review submitted through a Plannotator decision is durably archived at
+decision-settlement time, so a submission survives an agent-side timeout, a
+closed terminal, or a `planSave` setting the user turned off. One deliberate
+exception: a review posted straight to GitHub or GitLab with `POST
+/api/pr-action` is delivered to the platform and is **not** archived locally
+yet (a named follow-up). Layout, per project (same `{project}` key as
+`history/`):
+
+```
+${PLANNOTATOR_DATA_DIR}/feedback/{project}/
+  index.jsonl                                  # append-only, authoritative, schema v1
+  records/2026-08-31T14-22-07-511Z-review-feedback.md   # human-readable sidecar
+```
+
+The JSONL line is self-contained (`v`, `ts`, `client`, `clientVersion?`,
+`project`, `origin`, `surface`, `decision`, `target`, `feedback`,
+`annotations`, `counts`, `recordFile`) so an analyzer never has to open a
+sidecar; the markdown sidecar exists because the rest of the data dir is
+greppable markdown and is written only for records that carry content. Bare
+approvals, LGTMs, and dismissals are decision-only lines with no sidecar.
+
+**This index is shared, not Plannotator-private.** Several tools that share the
+data dir append to the SAME `feedback/{project}/index.jsonl`, separated by the
+`client` field on each line rather than by separate files. Known writers today:
+`plannotator` (this repo) and `plannotator-tui`, the Rust terminal client;
+`herdr-annotate` is reserved for a possible future Lite writer. Treat `client`
+as an open set, never an enum to validate against. Practical consequences: the
+line shape is a cross-tool contract, so fields are **added, never repurposed**;
+other clients suffix their id onto their sidecar filenames
+(`{stamp}-{surface}-{decision}-plannotator-tui.md`), so the `records/`
+directory holds more filename shapes than this repo writes and `recordFile` is
+the only valid handle to a sidecar (nothing may parse the name); and unknown
+fields must be ignored rather than rejected.
+
+Two optional fields are declared in v1 but not populated here, so their names
+are reserved across every client: `target.agent` (`{ host?, session?,
+transcript? }`) is the provenance for surfaces whose subject is an agent
+session rather than a file or a diff, such as annotate-last, and
+`clientVersion` is the writing client's own version where it knows it
+(`packages/shared` has no runtime-agnostic version constant, so this repo
+leaves it unset rather than reading `package.json` from a vendored module).
+
+Everything is written by one shared module, `packages/shared/feedback-archive.ts`
+(vendored to Pi as `apps/pi-extension/generated/feedback-archive.ts`), which
+resolves the data dir per call and **never throws**: a failed archive write is
+logged, degrades silently for the user, and keeps the annotation draft as the
+recovery copy. The append happens BEFORE `deleteDraft`, generalizing the #678
+ordering to every surface. Call sites: `packages/server/index.ts`
+(`/api/approve`, `/api/deny`), `packages/server/review.ts` (`/api/feedback`,
+`/api/exit`), `packages/server/annotate.ts` (`persistSubmittedDecision`,
+`/api/exit`), and the three Pi mirrors in `apps/pi-extension/server/`.
+
+Invariants worth keeping: records never contain patch bytes or a second copy of
+the plan (identity and a version-file reference instead); repeat decisions
+append rather than overwrite (unlike the legacy `plans/` snapshot, which is
+keyed by slug and status and is left alone); annotation `source` / `author`
+provenance is preserved so external, agent, and WebMCP findings stay
+distinguishable from the human's own comments; and `feedback` is listed in
+`PURGE_OWNED_TOP_LEVEL` (`packages/server/uninstall.ts`) so uninstall purge
+removes it. Controls and the privacy/retention note are in the
+`PLANNOTATOR_FEEDBACK_HISTORY` row of the environment table above. The read
+path in v1 is the files on disk (`jq` over `index.jsonl`, `grep` over
+`records/`); there is no CLI reader or UI surface yet.
+
+Details that surprise people:
+
+- **Index durability is a practical guarantee, not a formal one.** One record
+  is always exactly one line, and the whole line is handed to a single
+  append-mode write. That write is not one syscall (`appendFileSync` loops
+  internally until its buffer is drained); what holds in practice is that an
+  `O_APPEND` write of a line-sized buffer completes without interleaving on a
+  local filesystem. NFS and SMB do not promise even that, and a genuine
+  interleave damages **both** records that raced, not just the later one. The
+  backstop is the reader: unparsable lines are skipped, so everything else in
+  the file still reads. With several clients writing one index, this caveat is
+  worth knowing rather than assuming away.
+- **Readers gate on structure, not version.** `parseFeedbackIndex` keeps any
+  line that parses and carries a numeric `v`, so a newer writer's lines are
+  still returned; an analyzer that depends on v1 semantics should filter
+  `v <= 1` itself. Since fields are only added and never repurposed, a `v2`
+  would signal a real shape change rather than the arrival of new keys.
+- **Folder-session records name the folder, not the open document.** A folder
+  annotate session submits one body of feedback for the session, so
+  `target.filePath` is the session's folder; the per-document path is not part
+  of the record.
+- **URL-session records store the full URL, query string included**, because
+  that is the page that was reviewed. A URL carrying a token in its query is
+  therefore written to disk; the opt-out is the control for that.
+- **`target.review.cwd` is provenance, not a durable handle.** A PR review
+  started with `--local` records a per-PR pool checkout that is cleaned up when
+  the session ends; `target.review.pr` plus `gitRef` are the identity that
+  survives.
+- **Project bucketing prefers the caller's `project` option** (the `project`
+  field on `ReviewServerOptions`, mirroring the annotate server), falling back
+  to deriving a name from the review cwd. The fallback is wrong in PR mode,
+  where there is no `gitContext` and `--local` points `agentCwd` at
+  `pool/pr-<n>`, so every CLI entry point passes `detectProjectName()`.
+- **The test suite turns the archive off** through the `tests/setup/feedback-archive-off.ts`
+  preload in `bunfig.toml`, because most server tests boot a real server
+  without redirecting `PLANNOTATOR_DATA_DIR` and would otherwise write into the
+  contributor's own data dir. Tests that need the archive opt back in inside
+  their own test bodies.
+
 ## Plan Diff
 
 When a user denies a plan and Claude resubmits, the UI shows what changed between versions. A `+N/-M` badge appears below the document card; clicking it toggles between normal view and diff view.
@@ -639,6 +747,8 @@ interface Block {
 
 Text highlighting uses `web-highlighter` library. Code blocks use manual `<mark>` wrapping (web-highlighter can't select inside `<pre>`).
 
+**Annotation undo/redo:** each plan, annotate, or code-review app keeps one bounded 50-action stack for the active surface. `Mod+Z` undoes; `Mod+Shift+Z` and `Mod+Y` redo. Only local human annotation mutations are recorded, and a new mutation discards the redo branch. Native inputs, textareas, contenteditable regions, CodeMirror, dialogs/popovers, the Image Annotator, and an open Review Edit Mode session keep ownership of their own history shortcuts. External/agent writes do not enter annotation history; direct source changes, draft/share restore, refresh or diff replacement, identity changes, navigation to another document/message/review context, submission, and other baseline replacements clear it. The Image Annotator keeps a separate stroke undo/redo stack while its overlay is open.
+
 **Raw-HTML annotate:** the sandboxed viewer never mutates the visited page's DOM. Committed annotations render as numbered placed comment markers plus overlay-projected highlight rectangles inside a shadow-rooted fixed overlay host: the durable anchor data (element selector, text snapshot, normalized selected point) is persisted, and the markers/highlights are disposable projections re-resolved from it on every reconcile. Shift-click multi-select joins additional elements to one comment (`htmlAdditionalTargets`).
 
 **HTML and live-app interaction model:** raw-HTML sessions and live app sessions (`mode: "annotate-app"`) share one contract. Both open with pinpoint **armed** (`htmlAnnotateArmed` defaults to `true`, `packages/editor/App.tsx:493`; live sessions open armed like every other HTML surface, `App.tsx:2871`). `Esc` walks a ladder instead of exiting outright: a pending draft closes first, then the pinpoint hover outline clears, and only then does `Esc` drop the surface to **Interact**, where the bridge goes passive so clicks, forms, text selection, and SPA navigation reach the page natively (`packages/ui/components/html-viewer/bridge-script.ts:3066-3080`; committed markers stay visible and a marker click still opens its comment, and in Interact an open drag-comment draft still closes before `Esc` is handed back to the page). Vim owns its own ladder and is skipped here. The header **pen** button re-arms (`packages/editor/components/AppHeader.tsx:386-404`, `aria-pressed`), as does `Mod+Shift+A` (`packages/ui/shortcuts/plan-review/htmlAnnotate.shortcuts.ts:13-21`), which the bridge mirrors inside the iframe on the capture phase and forwards to the parent (`bridge-script.ts:3085-3091`), so the chord works whichever document owns focus. Text drag-selection commenting is **always live**, on both surfaces and in both states, ungated from the armed flag and from the input method (`bridge-script.ts:384-386`, `:1420-1436`): while armed, a click pins an element and a drag selects text at the same time, and the one-shot `dragEndedClick` guard stops a completed drag's trailing click from re-pinning (`bridge-script.ts:1381-1390`).
@@ -647,7 +757,7 @@ These surfaces are **comment-only**. `redline` (auto-DELETION) and `quickLabel` 
 
 **HTML Refresh (#1232).** A local rendered-HTML session can re-read its file from disk without reloading the tab, for the loop where an agent edits the page while the reviewer keeps annotating. The header **Refresh** button (left of the eye, `data-html-refresh`, titled "Refresh HTML from disk") fetches the active document through `/api/doc`, hands the bytes to the app, and remounts the viewer under a bumped `reloadGeneration` key (`packages/editor/App.tsx`, viewer `key`). The engine is the published `useHtmlRefresh` (`packages/ui/hooks/useHtmlRefresh.ts`: superseded and cross-document fetches are dropped, one restore acknowledgement per generation) and Plannotator's binding over `fetchHtmlDocumentSnapshot` is `packages/editor/hooks/useHtmlRefresh.ts` (toasts for refreshed, missing, and unavailable). Committed annotations survive on their durable anchors: the remounted viewer re-resolves every element selector and text snapshot against the new page, and the ones it cannot re-anchor are reported once (`onUnanchoredChange` to `reportAnnotationRestore`), toasted, and marked with an **Unanchored** chip in the annotations panel (`htmlUnanchoredIds` in App, cleared when the document changes); their comments stay in the panel and still export. A refresh keeps the version diff: for the root document `/api/doc` carries `previousPlan`/`versionInfo`/`diffHtml` recomputed against the bytes just read (see the annotate `/api/plan` row), `applyRefreshedHtml` sets them and resets `isPlanDiffActive`, so the view returns to normal mode with "Show changes" still available; a tab reload converges on the same state because `/api/plan` serves the current bytes and recomputes the same diff. `/api/share-html` shares the current bytes too. Only local files refresh: `canRefresh` is false for `http(s)` paths and live-app sessions, and the control is absent on read-only (archive) documents. The compact touch shell renders no header controls (`HtmlSurfaceControls` returns null when `compact`), so its Options menu offers "Refresh from disk" beside the Show/Hide tools and Interact/Annotate actions (`compactDocumentActions` in App, disabled while a refresh is in flight); a host that passes `canRefresh` and `onRefresh` to `HtmlSurfaceControls` gets the Refresh button with or without the eye.
 
-Known limitation: printing a raw-HTML annotate session prints highlight stripes from a best-effort absolute-coordinate layer and is degraded inside the iframe (pre-existing); element-only targets (SVG anchors, multi-select additional element targets) have no print representation.
+Known limitations: printing a raw-HTML annotate session prints highlight stripes from a best-effort absolute-coordinate layer and is degraded inside the iframe (pre-existing); element-only targets (SVG anchors, multi-select additional element targets) have no print representation. Annotation undo/redo listeners live in the parent document, so they are unavailable while focus is inside a raw-HTML or live-app iframe; the framed page keeps its own `Mod+Z`. Focus the editor chrome or annotation panel first. Forwarding this safely would require synchronizing parent history availability without stealing native or live-app undo; only the reserved `Mod+Shift+A` annotate toggle is currently forwarded.
 
 ## WebMCP (browser-agent tools)
 
@@ -672,10 +782,10 @@ Docs: `apps/marketing/src/content/docs/reference/webmcp-tools.md` (the user-faci
 The shortcut system has three layers:
 
 1. **Engine** (`packages/ui/shortcuts/{core,runtime}.ts`) — parser for declarative bindings (`Mod+Enter`, `Alt Alt` double-tap, `Alt hold`), dispatcher, platform-aware formatter (mac glyphs vs. `Ctrl`), validator, and the `useShortcutScope` / `useDoubleTapShortcuts` React hooks. Truly shared — both apps use it as-is.
-2. **Scopes** — `defineShortcutScope({ id, title, shortcuts: { actionId: { bindings, description, section, ... } } })`. One scope per UI surface (annotation toolbar, comment popover, file tree, etc.). Lives in `packages/ui/shortcuts/{plan-review,code-review}/` — **the subfolder names which app's UI the scope serves**. Components/Apps wire handlers to a scope via `useShortcutScope({ scope, handlers: { actionId: () => ... } })`.
+2. **Scopes** — `defineShortcutScope({ id, title, shortcuts: { actionId: { bindings, description, section, ... } } })`. One scope per UI surface (annotation toolbar, comment popover, file tree, etc.). App-specific scopes live in `packages/ui/shortcuts/{plan-review,code-review}/` — **the subfolder names which app's UI the scope serves** — while genuinely cross-app scopes such as `history.shortcuts.ts` live at the shortcuts root. Components/Apps wire handlers to a scope via `useShortcutScope({ scope, handlers: { actionId: () => ... } })`.
 3. **Surfaces** (`packages/editor/shortcuts.ts`, `packages/review-editor/shortcuts.ts`) — each app composes its scopes into a `ShortcutSurface` (`planReviewSurface`, `annotateSurface`, `codeReviewSurface`). Surfaces feed both the in-app help modal and the marketing site's auto-generated docs page.
 
-**Convention for adding new shortcuts:** define the action in the relevant scope file under the right subfolder (`plan-review/` or `code-review/`), declare the binding(s) and description, then wire a handler at the call site with `useShortcutScope`. The marketing docs page picks it up automatically at next build. Unit tests in `packages/ui/shortcuts.test.ts` enforce normalized binding tokens (`Mod`, `Shift`, `Alt`, `A-Z`, `1-0`, named keys, `F1`–`F12`) and unique scope ids.
+**Convention for adding new shortcuts:** define the action in the relevant app-specific subfolder (`plan-review/` or `code-review/`), or at the shortcuts root when both apps share the same action and semantics. Declare the binding(s) and description, then wire a handler at the call site with `useShortcutScope`. The marketing docs page picks it up automatically at next build. Unit tests in `packages/ui/shortcuts.test.ts` enforce normalized binding tokens (`Mod`, `Shift`, `Alt`, `A-Z`, `1-0`, named keys, `F1`–`F12`) and unique scope ids.
 
 **Marketing docs auto-generation:** `apps/marketing/src/lib/shortcutReference.ts` reads the three surfaces and `apps/marketing/src/components/ShortcutReference.astro` renders them as tables. The `/docs/reference/keyboard-shortcuts` page is special-cased in `apps/marketing/src/pages/docs/[...slug].astro` to render the component instead of the markdown body.
 

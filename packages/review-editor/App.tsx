@@ -55,6 +55,16 @@ import {
 } from './hooks/useReviewSearch';
 import { useEditorAnnotations } from '@plannotator/ui/hooks/useEditorAnnotations';
 import { useExternalAnnotations } from '@plannotator/ui/hooks/useExternalAnnotations';
+import { useUndoHistory } from '@plannotator/ui/hooks/useUndoHistory';
+import { useHistoryShortcuts } from '@plannotator/ui/shortcuts';
+import {
+  applyCollectionMutations,
+  hasActiveHistoryOverlay,
+  isHumanHistoryMutation,
+  isNativeHistoryOwner,
+  type CollectionMutation,
+  type HistoryDirection,
+} from '@plannotator/ui/utils/undoHistory';
 import { useAgentJobs, jobMatchesReviewContext } from '@plannotator/ui/hooks/useAgentJobs';
 import { exportEditorAnnotations } from '@plannotator/ui/utils/parser';
 import { buildReviewAgentInstructions } from '@plannotator/ui/utils/reviewAgentInstructions';
@@ -79,6 +89,9 @@ import { PRSelector } from './components/PRSelector';
 import { PRSwitchOverlay } from './components/PRSwitchOverlay';
 import { usePRStack } from './hooks/usePRStack';
 import { useDiffFreshness } from './hooks/useDiffFreshness';
+import { useAutoViewed } from './hooks/useAutoViewed';
+import { resolveDiffSwitchUnviews } from './utils/autoViewed';
+import { needsAutoViewedNotice, markAutoViewedNoticeSeen, turnOffAutoViewed, toggleAutoViewed } from './utils/autoViewedNotice';
 import { usePRSession, type PRSessionUpdate } from './hooks/usePRSession';
 import { useAnnotationFactory } from './hooks/useAnnotationFactory';
 import { DEMO_DIFF } from './demoData';
@@ -221,6 +234,28 @@ function orderFilesBySections(files: DiffFile[], sections?: SinceBaseSections | 
 /** Hint shown following the cursor while hovering a sidebar/panel resize handle. */
 const RESIZE_HANDLE_TOOLTIP = 'Click to close · Drag to resize';
 
+type ReviewHistoryAction =
+  | {
+      kind: 'code';
+      mutations: readonly CollectionMutation<CodeAnnotation>[];
+      beforeSelection: string | null;
+      afterSelection: string | null;
+    }
+  | {
+      kind: 'description';
+      mutations: readonly CollectionMutation<Annotation>[];
+      beforeSelection: string | null;
+      afterSelection: string | null;
+    }
+  | {
+      kind: 'comment';
+      mutations: readonly CollectionMutation<CommentAnnotation>[];
+      beforeSelection: string | null;
+      afterSelection: string | null;
+    };
+
+const reviewItemId = (item: { id: string }): string => item.id;
+
 interface CompactReviewOverlayProps {
   title: string;
   onClose: () => void;
@@ -300,13 +335,25 @@ const ReviewApp: React.FC = () => {
   const [files, setFiles] = useState<DiffFile[]>([]);
   const [activeFileIndex, setActiveFileIndex] = useState(0);
   const [annotations, setAnnotations] = useState<CodeAnnotation[]>([]);
+  const annotationsRef = useRef(annotations);
+  annotationsRef.current = annotations;
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const selectedAnnotationIdRef = useRef(selectedAnnotationId);
+  selectedAnnotationIdRef.current = selectedAnnotationId;
   // PR description prose annotations (comment-only; separate from the diff store).
   const [descriptionAnnotations, setDescriptionAnnotations] = useState<Annotation[]>([]);
+  const descriptionAnnotationsRef = useRef(descriptionAnnotations);
+  descriptionAnnotationsRef.current = descriptionAnnotations;
   const [selectedDescriptionAnnotationId, setSelectedDescriptionAnnotationId] = useState<string | null>(null);
+  const selectedDescriptionAnnotationIdRef = useRef(selectedDescriptionAnnotationId);
+  selectedDescriptionAnnotationIdRef.current = selectedDescriptionAnnotationId;
   // PR comment annotations (notes attached to a whole comment/review/thread).
   const [commentAnnotations, setCommentAnnotations] = useState<CommentAnnotation[]>([]);
+  const commentAnnotationsRef = useRef(commentAnnotations);
+  commentAnnotationsRef.current = commentAnnotations;
   const [selectedCommentAnnotationId, setSelectedCommentAnnotationId] = useState<string | null>(null);
+  const selectedCommentAnnotationIdRef = useRef(selectedCommentAnnotationId);
+  selectedCommentAnnotationIdRef.current = selectedCommentAnnotationId;
   // Sidebar → source-comment navigation signal; token bumps per click so
   // re-selecting the same comment re-scrolls. Consumed by PRCommentsTab.
   const [commentScrollTarget, setCommentScrollTarget] = useState<{ commentId: string; token: number } | null>(null);
@@ -451,6 +498,13 @@ const ReviewApp: React.FC = () => {
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const [copyRawDiffStatus, setCopyRawDiffStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [viewedFiles, setViewedFiles] = useState<Set<string>>(new Set());
+  // Auto-mark-viewed (Rule 3): files the reviewer manually UN-viewed. That
+  // gesture means "come back to this", so auto-view must never re-check them.
+  // Owned here because it rides the review draft alongside viewedFiles.
+  const [autoViewSuppressed, setAutoViewSuppressed] = useState<Set<string>>(new Set());
+  // Read by the diff-apply path, which must not re-run on every checkmark.
+  const viewedFilesRef = useRef(viewedFiles);
+  viewedFilesRef.current = viewedFiles;
   const [hideViewedFiles, setHideViewedFiles] = useState(false);
   // Generated-files sidecar (#1317): repo-relative paths marked
   // `linguist-generated` in `.gitattributes`. Their diffs seed collapsed on
@@ -550,6 +604,47 @@ const ReviewApp: React.FC = () => {
   }, [repoInfo]);
 
   const { prMetadata, prStackInfo, prStackTree, prDiffScope, prDiffScopeOptions, prPatchIncomplete, prPatchUpgradeAvailable, updatePRSession } = usePRSession();
+  const reviewHistoryContext = snapshotId ?? prMetadata?.url ?? diffData?.gitRef ?? 'loading';
+  const applyReviewHistory = useCallback((action: ReviewHistoryAction, direction: HistoryDirection) => {
+    switch (action.kind) {
+      case 'code':
+        setAnnotations((current) => {
+          const next = applyCollectionMutations(current, action.mutations, direction, reviewItemId);
+          annotationsRef.current = next;
+          return next;
+        });
+        selectedAnnotationIdRef.current = direction === 'undo' ? action.beforeSelection : action.afterSelection;
+        setSelectedAnnotationId(selectedAnnotationIdRef.current);
+        return;
+      case 'description':
+        setDescriptionAnnotations((current) => {
+          const next = applyCollectionMutations(current, action.mutations, direction, reviewItemId);
+          descriptionAnnotationsRef.current = next;
+          return next;
+        });
+        selectedDescriptionAnnotationIdRef.current = direction === 'undo' ? action.beforeSelection : action.afterSelection;
+        setSelectedDescriptionAnnotationId(selectedDescriptionAnnotationIdRef.current);
+        return;
+      case 'comment':
+        setCommentAnnotations((current) => {
+          const next = applyCollectionMutations(current, action.mutations, direction, reviewItemId);
+          commentAnnotationsRef.current = next;
+          return next;
+        });
+        selectedCommentAnnotationIdRef.current = direction === 'undo' ? action.beforeSelection : action.afterSelection;
+        setSelectedCommentAnnotationId(selectedCommentAnnotationIdRef.current);
+    }
+  }, []);
+  const reviewHistory = useUndoHistory<ReviewHistoryAction>({
+    context: reviewHistoryContext,
+    apply: applyReviewHistory,
+  });
+  useEffect(() => {
+    reviewHistory.clear();
+  }, [diffData?.rawPatch, reviewHistory]);
+  useEffect(() => {
+    if (submitted) reviewHistory.clear();
+  }, [reviewHistory, submitted]);
 
   // The Commits view (linear history rail) exists for plain local git
   // sessions only — PR/workspace/jj/p4 keep their existing panels. Unlike
@@ -816,17 +911,20 @@ const ReviewApp: React.FC = () => {
     descriptionAnnotations,
     commentAnnotations,
     viewedFiles,
+    autoViewSuppressed,
     isApiMode: !!origin,
     submitted: !!submitted,
   });
 
   const handleRestoreDraft = useCallback(() => {
+    reviewHistory.clear();
     const restored = restoreDraft();
     if (restored.annotations.length > 0) setAnnotations(restored.annotations);
     if (restored.descriptionAnnotations.length > 0) setDescriptionAnnotations(restored.descriptionAnnotations);
     if (restored.commentAnnotations.length > 0) setCommentAnnotations(restored.commentAnnotations);
     if (restored.viewedFiles.length > 0) setViewedFiles(new Set(restored.viewedFiles));
-  }, [restoreDraft]);
+    if (restored.autoViewSuppressed.length > 0) setAutoViewSuppressed(new Set(restored.autoViewSuppressed));
+  }, [restoreDraft, reviewHistory]);
 
   // Agent Instructions — copy a clipboard payload teaching external agents
   // (Claude Code, Codex, etc.) how to POST review comments into this session
@@ -1841,6 +1939,19 @@ const ReviewApp: React.FC = () => {
     if (range === null) setLineAnnotationComposeRequest(null);
   }, []);
 
+  const addCodeAnnotationsWithHistory = useCallback((items: readonly CodeAnnotation[]) => {
+    if (items.length === 0) return;
+    const startIndex = annotationsRef.current.length;
+    annotationsRef.current = [...annotationsRef.current, ...items];
+    setAnnotations(annotationsRef.current);
+    reviewHistory.record({
+      kind: 'code',
+      mutations: items.map((item, offset) => ({ kind: 'add', item, index: startIndex + offset })),
+      beforeSelection: selectedAnnotationIdRef.current,
+      afterSelection: selectedAnnotationIdRef.current,
+    });
+  }, [reviewHistory]);
+
   const handleAddAnnotationForFile = useCallback((
     filePath: string,
     type: CodeAnnotationType,
@@ -1875,9 +1986,9 @@ const ReviewApp: React.FC = () => {
       conventionalLabel,
       decorations,
     };
-    setAnnotations(prev => [...prev, withPRContext(newAnnotation)]);
+    addCodeAnnotationsWithHistory([withPRContext(newAnnotation)]);
     clearPendingSelection();
-  }, [pendingSelection, identity, withPRContext, clearPendingSelection]);
+  }, [pendingSelection, identity, withPRContext, clearPendingSelection, addCodeAnnotationsWithHistory]);
 
   const handleAddCallFlowAnnotation = useCallback((
     targets: readonly CallFlowAnnotationTarget[],
@@ -1905,9 +2016,9 @@ const ReviewApp: React.FC = () => {
       createdAt: Date.now(),
       author: identity,
     };
-    setAnnotations((previous) => [...previous, withPRContext(annotation)]);
+    addCodeAnnotationsWithHistory([withPRContext(annotation)]);
     return true;
-  }, [files, identity, withPRContext]);
+  }, [files, identity, withPRContext, addCodeAnnotationsWithHistory]);
 
   // Sink for the experimental edit-to-suggestion flow: a completed edit
   // session delivers one hunk per contiguous changed region, each becoming a
@@ -1918,9 +2029,8 @@ const ReviewApp: React.FC = () => {
   const handleAddSuggestionsForFile = useCallback((filePath: string, hunks: SuggestionHunk[]) => {
     if (hunks.length === 0) return;
     const now = Date.now();
-    setAnnotations(prev => [
-      ...prev,
-      ...hunks.map((hunk) => withPRContext({
+    addCodeAnnotationsWithHistory(
+      hunks.map((hunk) => withPRContext({
         id: generateId(),
         type: 'comment' as CodeAnnotationType,
         scope: 'line' as const,
@@ -1936,8 +2046,8 @@ const ReviewApp: React.FC = () => {
         createdAt: now,
         author: identity,
       })),
-    ]);
-  }, [identity, withPRContext]);
+    );
+  }, [identity, withPRContext, addCodeAnnotationsWithHistory]);
 
   // Sink for the edit session's "Make annotation" selection action: a plain
   // line-scoped comment whose anchor was mapped from the edited buffer to
@@ -1963,8 +2073,8 @@ const ReviewApp: React.FC = () => {
       createdAt: Date.now(),
       author: identity,
     };
-    setAnnotations(prev => [...prev, withPRContext(newAnnotation)]);
-  }, [identity, withPRContext]);
+    addCodeAnnotationsWithHistory([withPRContext(newAnnotation)]);
+  }, [identity, withPRContext, addCodeAnnotationsWithHistory]);
 
   const handleAddAnnotation = useCallback((
     type: CodeAnnotationType,
@@ -1997,8 +2107,8 @@ const ReviewApp: React.FC = () => {
       author: identity,
     };
 
-    setAnnotations(prev => [...prev, withPRContext(newAnnotation)]);
-  }, [files, activeFileIndex, identity, withPRContext]);
+    addCodeAnnotationsWithHistory([withPRContext(newAnnotation)]);
+  }, [files, activeFileIndex, identity, withPRContext, addCodeAnnotationsWithHistory]);
 
   const handleAddFileCommentForFile = useCallback((filePath: string, text: string) => {
     const trimmed = text.trim();
@@ -2017,8 +2127,8 @@ const ReviewApp: React.FC = () => {
       author: identity,
     };
 
-    setAnnotations(prev => [...prev, withPRContext(newAnnotation)]);
-  }, [identity, withPRContext]);
+    addCodeAnnotationsWithHistory([withPRContext(newAnnotation)]);
+  }, [identity, withPRContext, addCodeAnnotationsWithHistory]);
 
   // Edit annotation
   const handleEditAnnotation = useCallback((
@@ -2030,6 +2140,7 @@ const ReviewApp: React.FC = () => {
     decorations?: ConventionalDecoration[],
   ) => {
     const ann = allAnnotationsRef.current.find(a => a.id === id);
+    if (ann?.source) reviewHistory.clear();
     const updates: Partial<CodeAnnotation> = {
       ...(text !== undefined && { text }),
       ...(suggestedCode !== undefined && { suggestedCode }),
@@ -2042,10 +2153,20 @@ const ReviewApp: React.FC = () => {
       updateExternalAnnotation(id, updates);
       return;
     }
-    setAnnotations(prev => prev.map(a =>
-      a.id === id ? { ...a, ...updates } : a
-    ));
-  }, [updateExternalAnnotation, externalAnnotations]);
+    const before = annotationsRef.current.find((annotation) => annotation.id === id);
+    if (!before) return;
+    const after = { ...before, ...updates };
+    annotationsRef.current = annotationsRef.current.map((annotation) => annotation.id === id ? after : annotation);
+    setAnnotations(annotationsRef.current);
+    if (isHumanHistoryMutation(before)) {
+      reviewHistory.record({
+        kind: 'code',
+        mutations: [{ kind: 'edit', before, after }],
+        beforeSelection: selectedAnnotationIdRef.current,
+        afterSelection: selectedAnnotationIdRef.current,
+      });
+    }
+  }, [updateExternalAnnotation, externalAnnotations, reviewHistory]);
 
   // selectedAnnotationId is cleared via a functional update (not a captured
   // value): this handler is captured by Pierre slot portals (inline annotation
@@ -2054,21 +2175,42 @@ const ReviewApp: React.FC = () => {
   // deleting the currently-selected annotation.
   const handleDeleteAnnotation = useCallback((id: string) => {
     const ann = allAnnotationsRef.current.find(a => a.id === id);
+    if (ann?.source) reviewHistory.clear();
     if (ann?.source && externalAnnotations.some(e => e.id === id)) {
       deleteExternalAnnotation(id);
-      setSelectedAnnotationId(prev => (prev === id ? null : prev));
+      if (selectedAnnotationIdRef.current === id) {
+        selectedAnnotationIdRef.current = null;
+        setSelectedAnnotationId(null);
+      }
       return;
     }
-    setAnnotations(prev => prev.filter(a => a.id !== id));
-    setSelectedAnnotationId(prev => (prev === id ? null : prev));
-  }, [deleteExternalAnnotation, externalAnnotations]);
+    const index = annotationsRef.current.findIndex((annotation) => annotation.id === id);
+    const local = annotationsRef.current[index];
+    if (!local) return;
+    const beforeSelection = selectedAnnotationIdRef.current;
+    annotationsRef.current = annotationsRef.current.filter((annotation) => annotation.id !== id);
+    setAnnotations(annotationsRef.current);
+    const afterSelection = beforeSelection === id ? null : beforeSelection;
+    selectedAnnotationIdRef.current = afterSelection;
+    setSelectedAnnotationId(afterSelection);
+    if (isHumanHistoryMutation(local)) {
+      reviewHistory.record({
+        kind: 'code',
+        mutations: [{ kind: 'delete', item: local, index }],
+        beforeSelection,
+        afterSelection,
+      });
+    }
+  }, [deleteExternalAnnotation, externalAnnotations, reviewHistory]);
 
   // Handle identity change - update author on existing annotations
   const handleIdentityChange = useCallback((oldIdentity: string, newIdentity: string) => {
-    setAnnotations(prev => prev.map(ann =>
+    reviewHistory.clear();
+    annotationsRef.current = annotationsRef.current.map(ann =>
       ann.author === oldIdentity ? { ...ann, author: newIdentity } : ann
-    ));
-  }, []);
+    );
+    setAnnotations(annotationsRef.current);
+  }, [reviewHistory]);
 
   // Switch file in the dedicated center diff panel.
   const handleFilePreview = useCallback((index: number) => {
@@ -2092,6 +2234,34 @@ const ReviewApp: React.FC = () => {
     }
   }, [files, openDiffFile]);
 
+  // Best-effort GitHub viewed sync, shared by the manual toggle and the
+  // batched auto-view marks (`/api/pr-viewed` already takes an array).
+  const platformViewedSyncAvailable = !!prMetadata && prMetadata.platform === 'github';
+  const syncPlatformViewed = useCallback((filePaths: string[], viewed: boolean) => {
+    if (!prMetadata || prMetadata.platform !== 'github' || filePaths.length === 0) return;
+    fetch('/api/pr-viewed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePaths, viewed }),
+    }).catch(() => {
+      // Silently ignore — viewed sync is best-effort
+    });
+  }, [prMetadata]);
+
+  // Rule 3 of auto-mark-viewed. Called from inside the setViewedFiles updater
+  // below, which is where `willBeViewed` is known correctly under batching
+  // (the same reason the platform sync has always been called from there).
+  // Add/delete of one key is idempotent, so React strict mode's double
+  // invocation of that updater cannot flip the set.
+  const applyAutoViewSuppression = useCallback((filePath: string, viewed: boolean) => {
+    setAutoViewSuppressed(prev => {
+      if (viewed === !prev.has(filePath)) return prev;
+      const next = new Set(prev);
+      if (viewed) next.delete(filePath); else next.add(filePath);
+      return next;
+    });
+  }, []);
+
   const handleToggleViewed = useCallback((filePath: string) => {
     setViewedFiles(prev => {
       const next = new Set(prev);
@@ -2101,20 +2271,79 @@ const ReviewApp: React.FC = () => {
       } else {
         next.delete(filePath);
       }
+      // Un-viewing is the reviewer's "come back to this" gesture, so it
+      // suppresses auto-view for this file; marking it viewed by hand clears
+      // that suppression.
+      applyAutoViewSuppression(filePath, willBeViewed);
       // Sync viewed state to GitHub (fire and forget — best effort)
       // Capture willBeViewed inside the callback to ensure correctness with React batching
-      if (prMetadata && prMetadata.platform === 'github') {
-        fetch('/api/pr-viewed', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePaths: [filePath], viewed: willBeViewed }),
-        }).catch(() => {
-          // Silently ignore — viewed sync is best-effort
-        });
-      }
+      syncPlatformViewed([filePath], willBeViewed);
       return next;
     });
-  }, [prMetadata]);
+  }, [syncPlatformViewed, applyAutoViewSuppression]);
+
+  // Auto-mark-viewed. The marker never decides anything the reviewer can't
+  // undo: it only ADDS to viewedFiles, exactly like the `v` shortcut, and
+  // gates nothing on submit.
+  const autoViewedEnabled = useConfigValue('reviewAutoViewed');
+  const markFilesViewed = useCallback((paths: string[]) => {
+    setViewedFiles(prev => {
+      const missing = paths.filter(path => !prev.has(path));
+      if (missing.length === 0) return prev;
+      const next = new Set(prev);
+      for (const path of missing) next.add(path);
+      return next;
+    });
+  }, []);
+  const handleAutoView = useCallback(() => {
+    // The notice fires the first time auto-view demonstrates itself. Deferred
+    // (not lost) behind the guide takeover or a first-run dialog — the file
+    // still marks and the next auto-view retries the toast.
+    if (!needsAutoViewedNotice()) return;
+    if (guideOpen || guideIntroVisible || showLookAndFeel || showReviewSetup || editModeIntroVisible) return;
+    markAutoViewedNoticeSeen();
+    toast('Files are marked viewed as you scroll', {
+      description: "Scroll past a file or move on to the next and it's checked off. Turn this off in Settings → Git, or from the gear above the file list.",
+      duration: 10000,
+      position: 'top-right',
+      classNames: { toast: '!w-auto', description: '!text-foreground/70' },
+      action: {
+        label: 'Turn off',
+        onClick: () => {
+          turnOffAutoViewed();
+          toast('Auto-mark viewed is off', {
+            description: 'Re-enable it in Settings → Git.',
+            duration: 5000,
+            position: 'top-right',
+            classNames: { toast: '!w-auto', description: '!text-foreground/70' },
+          });
+        },
+      },
+    });
+  }, [guideOpen, guideIntroVisible, showLookAndFeel, showReviewSetup, editModeIntroVisible]);
+  const { handleReadingFileChange: handleAutoViewReadingFile, handleFileScrolledPast } = useAutoViewed({
+    enabled: autoViewedEnabled,
+    // Rule 4 — only the review target. The guide takeover CSS-hides the dock
+    // (so its files are not what the reviewer is reading), and a commit diff
+    // is a documented session-only detour, not the change under review.
+    suspended: guideOpen || activeDiffBase.startsWith('commit:'),
+    viewedFiles,
+    suppressedFiles: autoViewSuppressed,
+    onMark: markFilesViewed,
+    onSyncPlatformViewed: platformViewedSyncAvailable
+      ? (paths) => syncPlatformViewed(paths, true)
+      : undefined,
+    onAutoView: handleAutoView,
+    singleFileReadingFile: isDiffPanelActive ? files[activeFileIndex]?.path ?? null : null,
+    snapshotKey: `${snapshotId ?? ''}:${activeDiffBase}`,
+  });
+  const handleAllFilesVisibleFileChange = useCallback(
+    (filePath: string | null, info?: { collapsed: boolean }) => {
+      setAllFilesVisibleFile(filePath);
+      handleAutoViewReadingFile(filePath, info);
+    },
+    [handleAutoViewReadingFile],
+  );
 
   // The three-stack sections panel exists only for the since-base composite
   // view in a plain git session (PR/workspace keep the classic tree).
@@ -2140,8 +2369,15 @@ const ReviewApp: React.FC = () => {
 
   // Git add/staging logic
   const handleFileViewedFromStage = useCallback(
-    (path: string) => setViewedFiles(prev => new Set(prev).add(path)),
-    [],
+    (path: string) => {
+      setViewedFiles(prev => new Set(prev).add(path));
+      // Staging marks a file viewed, so it is a deliberate "I am done with
+      // this" exactly like `v`, the header button and the tree row — and like
+      // them it must clear any auto-view suppression, or a file the reviewer
+      // un-viewed and later staged would stay permanently off-limits.
+      applyAutoViewSuppression(path, true);
+    },
+    [applyAutoViewSuppression],
   );
   // Files already staged when the sidecar snapshot was taken — the hook folds
   // these into the effective staged set so pre-staged files toggle correctly.
@@ -2275,7 +2511,23 @@ const ReviewApp: React.FC = () => {
   // Shared helper: fetch a diff switch and update state.
   // Returns true on success, false on failure — callers that optimistically
   // updated UI state (e.g. the base picker) can use this to revert.
-  const fetchDiffSwitch = useCallback(async (fullDiffType: string, baseOverride?: string, options?: { preserveFile?: boolean; explicitBase?: boolean }): Promise<boolean> => {
+  const fetchDiffSwitch = useCallback(async (
+    fullDiffType: string,
+    baseOverride?: string,
+    options?: {
+      preserveFile?: boolean;
+      explicitBase?: boolean;
+      /**
+       * Re-fetch of the SAME diff selection, where a per-path patch delta is a
+       * real content change. Set ONLY by the staleness refresh and the
+       * post-fetch base refresh: it is what licenses auto-mark-viewed's Rule 5
+       * to drop a checkmark. Never set by the whitespace toggle (its deltas
+       * are a presentation choice) nor by any switch that changes what is
+       * being compared, including a commit detour.
+       */
+      contentRefresh?: boolean;
+    },
+  ): Promise<boolean> => {
     setIsLoadingDiff(true);
     try {
       const res = await fetch('/api/diff/switch', {
@@ -2330,6 +2582,35 @@ const ReviewApp: React.FC = () => {
       setSnapshotId(data.snapshotId);
 
       const nextFiles = orderFilesBySections(parseDiffToFiles(data.rawPatch), data.sections);
+      // Rule 5 of auto-mark-viewed: a checkmark on content that has since
+      // changed is misleading, so it drops. No platform sync — GitHub applies
+      // the same rule to its own viewed state server-side.
+      //
+      // This is the ONE apply path every diff transition funnels through, so
+      // the scope gate lives in resolveDiffSwitchUnviews rather than here: an
+      // opt-in from the caller, re-checked against the identity of the diff.
+      // Without it, entering a commit detour or folding whitespace out would
+      // strip checkmarks off files nothing changed in.
+      const unviewed = resolveDiffSwitchUnviews({
+        enabled: autoViewedEnabled,
+        contentRefresh: options?.contentRefresh === true,
+        requestedDiffType: fullDiffType,
+        activeDiffType: diffType,
+        requestedBase: baseOverride ?? selectedBase,
+        activeBase: selectedBase,
+        appliedDiffType: data.diffType,
+        isCommitDiffType,
+        previousFiles: files,
+        nextFiles,
+        viewedFiles: viewedFilesRef.current,
+      });
+      if (unviewed.length > 0) {
+        setViewedFiles(prev => {
+          const next = new Set(prev);
+          for (const path of unviewed) next.delete(path);
+          return next;
+        });
+      }
       applySemanticDiffAdvert(data.semanticDiff);
       applyCallFlowAdvert(data.callFlow);
       setSections(data.sections ?? null);
@@ -2412,7 +2693,7 @@ const ReviewApp: React.FC = () => {
     } finally {
       setIsLoadingDiff(false);
     }
-  }, [dockApi, resetStagedFiles, selectedBase, diffHideWhitespace, files, activeFileIndex, openDiffFile, applySemanticDiffAdvert, applyCallFlowAdvert, clearPendingSelection]);
+  }, [dockApi, resetStagedFiles, selectedBase, diffHideWhitespace, files, activeFileIndex, openDiffFile, applySemanticDiffAdvert, applyCallFlowAdvert, clearPendingSelection, autoViewedEnabled, diffType]);
 
   // Switch the base branch the current diff compares against.
   // Only triggers a refetch when the active mode actually uses a base.
@@ -2685,7 +2966,7 @@ const ReviewApp: React.FC = () => {
       setBaseBehindRemote(data.baseBehindRemote === true);
       const now = liveSelectionRef.current;
       if (now.diffType === captured.diffType && now.selectedBase === captured.selectedBase) {
-        await fetchDiffSwitch(captured.diffType, captured.selectedBase ?? undefined, { preserveFile: true });
+        await fetchDiffSwitch(captured.diffType, captured.selectedBase ?? undefined, { preserveFile: true, contentRefresh: true });
       }
     } catch {
       // Best-effort: the banner stays and the user can retry.
@@ -2716,8 +2997,9 @@ const ReviewApp: React.FC = () => {
       return;
     }
     // Same params, fresh snapshot. preserveFile keeps the reviewer on the
-    // file they were reading.
-    void fetchDiffSwitch(diffType, selectedBase, { preserveFile: true });
+    // file they were reading; contentRefresh licenses Rule 5, because here a
+    // per-path patch delta really is the content having changed underneath.
+    void fetchDiffSwitch(diffType, selectedBase, { preserveFile: true, contentRefresh: true });
     // New commits are part of what went stale — bring the rail along.
     if (showCommitsPanel) commitsView.refresh();
   }, [prMetadata, prDiffScope, prPatchIncomplete, handlePRDiffScopeSelect, handleLoadFullDiff, fetchDiffSwitch, diffType, selectedBase, showCommitsPanel, commitsView.refresh]);
@@ -2734,7 +3016,11 @@ const ReviewApp: React.FC = () => {
     // An inline selection supersedes any pending sidebar/findings navigate target,
     // so a later remount (Refresh / base switch) doesn't re-scroll back to it.
     setScrollTargetAnnotation(null);
-    setSelectedAnnotationId(prev => (!id || prev === id ? null : id));
+    setSelectedAnnotationId(prev => {
+      const next = !id || prev === id ? null : id;
+      selectedAnnotationIdRef.current = next;
+      return next;
+    });
   }, []);
 
   // --- PR description annotations (comment-only prose store) ---
@@ -2742,13 +3028,28 @@ const ReviewApp: React.FC = () => {
   // data. The wrapper reconciles marks (apply new / remove deleted) off this store.
   const handleAddDescriptionAnnotation = useCallback((ann: Annotation) => {
     // Stamp the active PR so the note stays bound to it across an in-place switch.
-    setDescriptionAnnotations(prev => [...prev, { ...ann, prUrl: prMetadata?.url }]);
+    const annotation = { ...ann, prUrl: prMetadata?.url };
+    const index = descriptionAnnotationsRef.current.length;
+    const beforeSelection = selectedDescriptionAnnotationIdRef.current;
+    descriptionAnnotationsRef.current = [...descriptionAnnotationsRef.current, annotation];
+    setDescriptionAnnotations(descriptionAnnotationsRef.current);
+    selectedDescriptionAnnotationIdRef.current = ann.id;
     setSelectedDescriptionAnnotationId(ann.id);
     if (ann.artifact) setSelectedCommentAnnotationId(null);
-  }, [prMetadata?.url]);
+    reviewHistory.record({
+      kind: 'description',
+      mutations: [{ kind: 'add', item: annotation, index }],
+      beforeSelection,
+      afterSelection: ann.id,
+    });
+  }, [prMetadata?.url, reviewHistory]);
 
   const handleSelectDescriptionAnnotation = useCallback((id: string | null) => {
-    setSelectedDescriptionAnnotationId(prev => (!id || prev === id ? null : id));
+    setSelectedDescriptionAnnotationId(prev => {
+      const next = !id || prev === id ? null : id;
+      selectedDescriptionAnnotationIdRef.current = next;
+      return next;
+    });
     if (!id) return;
     const ann = descriptionAnnotations.find(a => a.id === id);
     if (ann?.artifact) {
@@ -2758,9 +3059,22 @@ const ReviewApp: React.FC = () => {
   }, [descriptionAnnotations, openPRArtifactsPanel]);
 
   const handleDeleteDescriptionAnnotation = useCallback((id: string) => {
-    setDescriptionAnnotations(prev => prev.filter(a => a.id !== id));
-    setSelectedDescriptionAnnotationId(prev => (prev === id ? null : prev));
-  }, []);
+    const index = descriptionAnnotationsRef.current.findIndex((annotation) => annotation.id === id);
+    const annotation = descriptionAnnotationsRef.current[index];
+    if (!annotation) return;
+    const beforeSelection = selectedDescriptionAnnotationIdRef.current;
+    descriptionAnnotationsRef.current = descriptionAnnotationsRef.current.filter((item) => item.id !== id);
+    setDescriptionAnnotations(descriptionAnnotationsRef.current);
+    const afterSelection = beforeSelection === id ? null : beforeSelection;
+    selectedDescriptionAnnotationIdRef.current = afterSelection;
+    setSelectedDescriptionAnnotationId(afterSelection);
+    reviewHistory.record({
+      kind: 'description',
+      mutations: [{ kind: 'delete', item: annotation, index }],
+      beforeSelection,
+      afterSelection,
+    });
+  }, [reviewHistory]);
 
   // Ask AI about a description selection — file-less scope ask (same mechanism
   // the HTML viewer uses). The popover passes the label + selected text.
@@ -2783,13 +3097,27 @@ const ReviewApp: React.FC = () => {
       prUrl: prMetadata?.url, // bind to the active PR (survives an in-place switch)
       artifact: options?.artifact,
     };
-    setCommentAnnotations(prev => [...prev, ann]);
+    const index = commentAnnotationsRef.current.length;
+    const beforeSelection = selectedCommentAnnotationIdRef.current;
+    commentAnnotationsRef.current = [...commentAnnotationsRef.current, ann];
+    setCommentAnnotations(commentAnnotationsRef.current);
+    selectedCommentAnnotationIdRef.current = ann.id;
     setSelectedCommentAnnotationId(ann.id);
     if (ann.artifact) setSelectedDescriptionAnnotationId(null);
-  }, [prMetadata?.url]);
+    reviewHistory.record({
+      kind: 'comment',
+      mutations: [{ kind: 'add', item: ann, index }],
+      beforeSelection,
+      afterSelection: ann.id,
+    });
+  }, [prMetadata?.url, reviewHistory]);
 
   const handleSelectCommentAnnotation = useCallback((id: string | null) => {
-    setSelectedCommentAnnotationId(prev => (!id || prev === id ? null : id));
+    setSelectedCommentAnnotationId(prev => {
+      const next = !id || prev === id ? null : id;
+      selectedCommentAnnotationIdRef.current = next;
+      return next;
+    });
     if (!id) return;
     // Reveal the source comment: open the PR Overview panel and signal
     // PRCommentsTab to select + scroll to it.
@@ -2804,9 +3132,22 @@ const ReviewApp: React.FC = () => {
   }, [commentAnnotations, openPROverviewPanel, openPRArtifactsPanel]);
 
   const handleDeleteCommentAnnotation = useCallback((id: string) => {
-    setCommentAnnotations(prev => prev.filter(a => a.id !== id));
-    setSelectedCommentAnnotationId(prev => (prev === id ? null : prev));
-  }, []);
+    const index = commentAnnotationsRef.current.findIndex((annotation) => annotation.id === id);
+    const annotation = commentAnnotationsRef.current[index];
+    if (!annotation) return;
+    const beforeSelection = selectedCommentAnnotationIdRef.current;
+    commentAnnotationsRef.current = commentAnnotationsRef.current.filter((item) => item.id !== id);
+    setCommentAnnotations(commentAnnotationsRef.current);
+    const afterSelection = beforeSelection === id ? null : beforeSelection;
+    selectedCommentAnnotationIdRef.current = afterSelection;
+    setSelectedCommentAnnotationId(afterSelection);
+    reviewHistory.record({
+      kind: 'comment',
+      mutations: [{ kind: 'delete', item: annotation, index }],
+      beforeSelection,
+      afterSelection,
+    });
+  }, [reviewHistory]);
 
   const handleAskAIForComment = useCallback<CommentAskAIHandler>((question, context) => {
     askAI({
@@ -3016,7 +3357,8 @@ const ReviewApp: React.FC = () => {
     fetchPRContext,
     platformUser,
     openDiffFile,
-    onAllFilesVisibleFileChange: setAllFilesVisibleFile,
+    onAllFilesVisibleFileChange: handleAllFilesVisibleFileChange,
+    onAllFilesFileScrolledPast: handleFileScrolledPast,
     isAllFilesActive,
     allFilesOrder,
     allFilesAllCollapsed,
@@ -3064,6 +3406,7 @@ const ReviewApp: React.FC = () => {
     handleAskAI, handleAskAIForFile, handleViewAIResponse, handleClickAIMarker,
     aiHistoryForSelection, getAIHistoryForFile, agentJobs.jobs, prMetadata, prContext, prArtifacts,
     isPRContextLoading, prContextError, fetchPRContext, platformUser, openDiffFile,
+    handleAllFilesVisibleFileChange, handleFileScrolledPast,
     handleOpenTour, handleOpenGuide, isAllFilesActive, allFilesOrder, allFilesAllCollapsed, onToggleAllFilesCollapsed, registerAllFilesCollapseToggle, commitInfo, isSemanticDiffActive, semanticDiffUsable,
     handleSemanticDiffUnavailable, handleSemanticDiffLoadError, handleSemanticDiffLoadSuccess, handleAddAnnotationForFile,
     callFlowAvailable, callFlowAdvert, callFlowAnalysis, retryCallFlowAnalysis, isCallFlowNodeInPatch, isCallFlowActive, openCallFlowPanel, callFlowInstall,
@@ -3090,6 +3433,12 @@ const ReviewApp: React.FC = () => {
   const handleToggleReviewViewedControls = useCallback(() => {
     configStore.set('reviewShowViewedControls', !reviewShowViewedControls);
   }, [reviewShowViewedControls]);
+
+  // An explicit toggle here (or in Settings) is proof the reviewer found the
+  // switch, so the first-time notice is consumed either way.
+  const handleToggleAutoViewed = useCallback(() => {
+    toggleAutoViewed(!autoViewedEnabled);
+  }, [autoViewedEnabled]);
 
   const handleToggleReviewStageControls = useCallback(() => {
     configStore.set('reviewShowStageControls', !reviewShowStageControls);
@@ -3391,6 +3740,48 @@ const ReviewApp: React.FC = () => {
       window.removeEventListener('keyup', handleKeyUp);
     };
   }, [prMetadata, showDestSpotlight, dismissDestSpotlight]);
+
+  const canHandleReviewHistoryShortcut = useCallback((event: KeyboardEvent): boolean => {
+    if (event.defaultPrevented || isNativeHistoryOwner(event)) return false;
+    if (submitted || isSendingFeedback || isApproving || isExiting || isPlatformActioning || isLoadingDiff) return false;
+    if (guideOpen || openSettingsMenu || showDestinationMenu || platformCommentDialog || showExportModal || showWorktreeDialog || showNoAnnotationsDialog || showApproveWarning || showExitWarning) return false;
+    if (showLookAndFeel || showGuideIntro || showReviewSetup || editModeIntroVisible || tourDialogJobId) return false;
+    return !hasActiveHistoryOverlay(document);
+  }, [
+    guideOpen,
+    isApproving,
+    isExiting,
+    isLoadingDiff,
+    isPlatformActioning,
+    isSendingFeedback,
+    editModeIntroVisible,
+    openSettingsMenu,
+    platformCommentDialog,
+    showApproveWarning,
+    showDestinationMenu,
+    showExitWarning,
+    showExportModal,
+    showNoAnnotationsDialog,
+    showWorktreeDialog,
+    showGuideIntro,
+    showLookAndFeel,
+    showReviewSetup,
+    submitted,
+    tourDialogJobId,
+  ]);
+
+  useHistoryShortcuts({
+    handlers: {
+      undo: {
+        when: (event) => canHandleReviewHistoryShortcut(event) && reviewHistory.canUndo,
+        handle: () => { reviewHistory.undo(); },
+      },
+      redo: {
+        when: (event) => canHandleReviewHistoryShortcut(event) && reviewHistory.canRedo,
+        handle: () => { reviewHistory.redo(); },
+      },
+    },
+  });
 
   // Cmd/Ctrl+Enter keyboard shortcut to approve or send feedback
   useEffect(() => {
@@ -4144,6 +4535,8 @@ const ReviewApp: React.FC = () => {
                 onStageFile={stageFile}
                 showStageControls={reviewShowStageControls}
                 onToggleShowStageControls={handleToggleReviewStageControls}
+                autoViewed={autoViewedEnabled}
+                onToggleAutoViewed={handleToggleAutoViewed}
                 isLoadingDiff={isLoadingDiff}
                 availableBranches={gitContext?.availableBranches}
                 selectedBase={selectedBase ?? undefined}
@@ -4265,6 +4658,8 @@ const ReviewApp: React.FC = () => {
                 stagedFiles={stagedFiles}
                 showStageControls={reviewShowStageControls}
                 onToggleShowStageControls={handleToggleReviewStageControls}
+                autoViewed={autoViewedEnabled}
+                onToggleAutoViewed={handleToggleAutoViewed}
                 onCopyRawDiff={handleCopyDiff}
                 canCopyRawDiff={!!diffData?.rawPatch}
                 copyRawDiffStatus={copyRawDiffStatus}
